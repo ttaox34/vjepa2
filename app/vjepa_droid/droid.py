@@ -18,6 +18,8 @@ import torch.utils.data
 from decord import VideoReader, cpu
 from scipy.spatial.transform import Rotation
 
+from app.vjepa_droid.game_dataset import RetroGameDataset
+
 _GLOBAL_SEED = 0
 logger = getLogger()
 
@@ -40,15 +42,42 @@ def init_data(
     transform=None,
     camera_frame=False,
     tubelet_size=2,
+    dataset_type="droid",
+    retro_paths=None,
+    action_dim=7,
+    state_keys=None,
+    frame_stride=None,
 ):
-    dataset = DROIDVideoDataset(
-        data_path=data_path,
-        frames_per_clip=frames_per_clip,
-        transform=transform,
-        fps=fps,
-        camera_views=camera_views,
-        frameskip=tubelet_size,
-        camera_frame=camera_frame,
+    dataset_type = (dataset_type or "droid").lower()
+    drop_last = drop_last if dataset_type != "retro" else False
+    if dataset_type == "retro":
+        if retro_paths is None or len(retro_paths) == 0:
+            raise ValueError("retro dataset selected but no retro_paths provided.")
+        dataset = RetroGameDataset(
+            data_paths=retro_paths,
+            frames_per_clip=frames_per_clip,
+            frame_stride=frame_stride or 1,
+            transform=transform,
+            action_dim=action_dim,
+            state_keys=state_keys,
+        )
+    else:
+        dataset = DROIDVideoDataset(
+            data_path=data_path,
+            frames_per_clip=frames_per_clip,
+            transform=transform,
+            fps=fps,
+            camera_views=camera_views,
+            frameskip=tubelet_size,
+            camera_frame=camera_frame,
+        )
+    dataset_len = len(dataset)
+    if dataset_len == 0:
+        raise ValueError("Dataset is empty after preprocessing; check dataset paths and clip settings.")
+    stride_value = frame_stride if (frame_stride is not None) else tubelet_size
+    logger.info(
+        f"Initialized {dataset_type} dataset with {dataset_len} clips "
+        f"({frames_per_clip=} stride={stride_value} {batch_size=})"
     )
 
     dist_sampler = torch.utils.data.distributed.DistributedSampler(

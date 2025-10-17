@@ -1,0 +1,73 @@
+app: vjepa_droid
+nodes: 8
+tasks_per_node: 8
+cpus_per_task: 12
+mem_per_gpu: 120G
+folder: output/test/game-10162131
+data:
+  dataset_type: retro
+  datasets:
+    - /inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/mingyu/GAME/data/trajectories/retro/RoboWarrior-Nes/random
+  dataset_fpcs:
+    - 8
+  frame_stride: 1
+  state_keys:
+    - energy
+    - health
+    - score
+  batch_size: 12
+  crop_size: 256
+  patch_size: 16
+  fps: null
+  num_workers: 8
+  pin_mem: true
+  persistent_workers: true
+  tubelet_size: 2
+data_aug:
+  auto_augment: false
+  horizontal_flip: false
+  motion_shift: false
+  random_resize_aspect_ratio:
+    - 0.75
+    - 1.35
+  random_resize_scale:
+    - 0.5
+    - 1.0
+  reprob: 0.0
+loss:
+  auto_steps: 2
+  loss_exp: 1.0
+  normalize_reps: true
+  reg_coeff: 0.0
+meta:
+  dtype: bfloat16
+  eval_freq: 100
+  resume_checkpoint: null
+  load_predictor: false
+  pretrain_checkpoint: /inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/mingyu/genie-game/vjepa2-mc/checkpoints/vitl.pt
+  context_encoder_key: target_encoder
+  target_encoder_key: target_encoder
+  save_every_freq: 25
+  seed: 239
+  use_sdpa: true
+model:
+  model_name: vit_large
+  pred_depth: 24
+  pred_embed_dim: 1024
+  pred_is_frame_causal: true
+  pred_num_heads: 16
+  action_embed_dim: 9
+  uniform_power: true
+  use_activation_checkpointing: true
+  use_extrinsics: false
+  use_rope: true
+optimization:
+  anneal: 15
+  epochs: 200
+  final_lr: 0.0
+  final_weight_decay: 0.04
+  ipe: 300
+  lr: 0.00035
+  start_lr: 0.00005
+  warmup: 15
+  weight_decay: 0.04

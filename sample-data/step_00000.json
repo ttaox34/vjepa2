@@ -1,0 +1,27 @@
+{
+    "game_name": "RoboWarrior-Nes",
+    "rl_model": "CustomPPO",
+    "reward_mode": "L2",
+    "timestamp": "2025-09-13T10:36:50.324686",
+    "step": 0,
+    "observation_image_path": "step_00000.png",
+    "action": [
+        1,
+        0,
+        0,
+        1,
+        1,
+        1,
+        0,
+        0,
+        1
+    ],
+    "reward": 0.0,
+    "terminated": false,
+    "truncated": false,
+    "info": {
+        "energy": 255,
+        "health": 5,
+        "score": 0
+    }
+}

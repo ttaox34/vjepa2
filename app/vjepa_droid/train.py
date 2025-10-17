@@ -100,8 +100,14 @@ def main(args, resume_preempt=False):
 
     # -- DATA
     cfgs_data = args.get("data")
+    dataset_type = cfgs_data.get("dataset_type", "droid").lower()
     datasets = cfgs_data.get("datasets", [])
-    dataset_path = datasets[0]
+    if dataset_type == "droid":
+        if len(datasets) == 0:
+            raise ValueError("At least one dataset path must be provided for DROID training.")
+        dataset_path = datasets[0]
+    else:
+        dataset_path = None
     dataset_fpcs = cfgs_data.get("dataset_fpcs")
     max_num_frames = max(dataset_fpcs)
     camera_frame = cfgs_data.get("camera_frame", False)
@@ -112,6 +118,8 @@ def main(args, resume_preempt=False):
     fps = cfgs_data.get("fps")
     crop_size = cfgs_data.get("crop_size", 256)
     patch_size = cfgs_data.get("patch_size")
+    frame_stride = cfgs_data.get("frame_stride")
+    state_keys = cfgs_data.get("state_keys")
     pin_mem = cfgs_data.get("pin_mem", False)
     num_workers = cfgs_data.get("num_workers", 1)
     persistent_workers = cfgs_data.get("persistent_workers", True)
@@ -189,18 +197,20 @@ def main(args, resume_preempt=False):
     )
 
     # -- init model
+    action_embed_dim = cfgs_model.get("action_embed_dim", 7)
+    model_num_frames = max_num_frames * max(1, tubelet_size)
     encoder, predictor = init_video_model(
         uniform_power=uniform_power,
         device=device,
         patch_size=patch_size,
-        max_num_frames=512,
+        max_num_frames=model_num_frames,
         tubelet_size=tubelet_size,
         model_name=model_name,
         crop_size=crop_size,
         pred_depth=pred_depth,
         pred_num_heads=pred_num_heads,
         pred_embed_dim=pred_embed_dim,
-        action_embed_dim=7,
+        action_embed_dim=action_embed_dim,
         pred_is_frame_causal=pred_is_frame_causal,
         use_extrinsics=use_extrinsics,
         use_sdpa=use_sdpa,
@@ -233,9 +243,10 @@ def main(args, resume_preempt=False):
     # -- init data-loaders/samplers
     (unsupervised_loader, unsupervised_sampler) = init_data(
         data_path=dataset_path,
+        retro_paths=datasets if dataset_type == "retro" else None,
         batch_size=batch_size,
         frames_per_clip=max_num_frames,
-        tubelet_size=1,
+        tubelet_size=tubelet_size,
         fps=fps,
         camera_views=camera_views,
         camera_frame=camera_frame,
@@ -247,6 +258,10 @@ def main(args, resume_preempt=False):
         pin_mem=pin_mem,
         persistent_workers=persistent_workers,
         rank=rank,
+        dataset_type=dataset_type,
+        action_dim=action_embed_dim,
+        state_keys=state_keys,
+        frame_stride=frame_stride,
     )
     _dlen = len(unsupervised_loader)
     if ipe is None:
@@ -405,11 +420,11 @@ def main(args, resume_preempt=False):
                 _new_wd = wd_scheduler.step()
                 # --
 
-                def forward_target(c):
+                def forward_target(c, batch):
                     with torch.no_grad():
                         c = c.permute(0, 2, 1, 3, 4).flatten(0, 1).unsqueeze(2).repeat(1, 1, 2, 1, 1)
                         h = target_encoder(c)
-                        h = h.view(batch_size, max_num_frames, -1, h.size(-1)).flatten(1, 2)
+                        h = h.view(batch, max_num_frames, -1, h.size(-1)).flatten(1, 2)
                         if normalize_reps:
                             h = F.layer_norm(h, (h.size(-1),))
                         return h
@@ -417,7 +432,60 @@ def main(args, resume_preempt=False):
                 def forward_predictions(z):
 
                     def _step_predictor(_z, _a, _s, _e):
-                        _z = predictor(_z, _a, _s, _e)
+                        context_frames = _z.size(1) // tokens_per_frame
+                        if context_frames <= 0:
+                            raise RuntimeError("Context frames must be positive.")
+
+                        def _pad_or_trim(seq, target_frames):
+                            current = seq.size(1)
+                            if seq.dim() == 2:
+                                seq = seq.unsqueeze(-1)
+                            if current < target_frames:
+                                pad_shape = (seq.size(0), target_frames - current, seq.size(-1))
+                                pad = seq[:, -1:, :].expand(pad_shape)
+                                seq = torch.cat([seq, pad], dim=1)
+                            else:
+                                seq = seq[:, :target_frames, :]
+                            return seq.squeeze(-1) if seq.size(-1) == 1 else seq
+
+                        _a = _pad_or_trim(_a, context_frames)
+                        _s = _pad_or_trim(_s, context_frames)
+                        if _e is not None:
+                            _e = _pad_or_trim(_e, context_frames)
+
+                        def _ensure_width(tensor, width, name):
+                            if tensor.size(-1) == width:
+                                return tensor
+                            if tensor.size(-1) > width:
+                                return tensor[..., :width]
+                            pad = torch.zeros(
+                                tensor.size(0),
+                                tensor.size(1),
+                                width - tensor.size(-1),
+                                device=tensor.device,
+                                dtype=tensor.dtype,
+                            )
+                            logger.warning(
+                                f"{name} width mismatch detected (found {tensor.size(-1)}, expected {width}); padding."
+                            )
+                            return torch.cat([tensor, pad], dim=-1)
+
+                        _a = _ensure_width(_a, action_embed_dim, "actions")
+                        _s = _ensure_width(_s, action_embed_dim, "states")
+                        if _e is not None:
+                            _e = _ensure_width(_e, action_embed_dim, "extrinsics")
+
+                        try:
+                            _z = predictor(_z, _a, _s, _e)
+                        except RuntimeError as err:
+                            logger.error(
+                                "Predictor input shape mismatch: "
+                                f"z={_z.shape}, a={_a.shape}, s={_s.shape}, "
+                                f"e={None if _e is None else _e.shape}; "
+                                f"tokens_per_frame={tokens_per_frame}, context_frames={context_frames}"
+                            )
+                            raise
+
                         if normalize_reps:
                             _z = F.layer_norm(_z, (_z.size(-1),))
                         return _z
@@ -442,7 +510,8 @@ def main(args, resume_preempt=False):
 
                 # Step 1. Forward
                 with torch.cuda.amp.autocast(dtype=dtype, enabled=mixed_precision):
-                    h = forward_target(clips)
+                    current_batch_size = clips.size(0)
+                    h = forward_target(clips, current_batch_size)
                     z_tf, z_ar = forward_predictions(h)
                     jloss = loss_fn(z_tf, h)
                     sloss = loss_fn(z_ar, h)
