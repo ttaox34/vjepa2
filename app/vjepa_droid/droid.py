@@ -47,19 +47,23 @@ def init_data(
     action_dim=7,
     state_keys=None,
     frame_stride=None,
+    manifest_paths=None,
 ):
     dataset_type = (dataset_type or "droid").lower()
     drop_last = drop_last if dataset_type != "retro" else False
     if dataset_type == "retro":
-        if retro_paths is None or len(retro_paths) == 0:
-            raise ValueError("retro dataset selected but no retro_paths provided.")
+        retro_sources = list(retro_paths) if retro_paths else []
+        if not retro_sources and not manifest_paths:
+            raise ValueError("retro dataset selected but no retro_paths or manifest_paths provided.")
         dataset = RetroGameDataset(
-            data_paths=retro_paths,
+            data_paths=retro_sources,
             frames_per_clip=frames_per_clip,
             frame_stride=frame_stride or 1,
             transform=transform,
             action_dim=action_dim,
             state_keys=state_keys,
+            manifest_paths=manifest_paths,
+            action_mappings=action_mappings,
         )
     else:
         dataset = DROIDVideoDataset(
@@ -97,7 +101,7 @@ def init_data(
 
     logger.info("VideoDataset unsupervised data loader created")
 
-    return data_loader, dist_sampler
+    return dataset, data_loader, dist_sampler
 
 
 def get_json(directory):

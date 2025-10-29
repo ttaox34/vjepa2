@@ -8,13 +8,15 @@ data:
   dataset_type: retro
   datasets:
     - /inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/mingyu/GAME/data/trajectories/retro/RoboWarrior-Nes/random
+  manifest_paths:
+    - /inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/mingyu/GAME/data/trajectories/retro/RoboWarrior-Nes/random/manifest.jsonl
   dataset_fpcs:
     - 8
   frame_stride: 1
-  state_keys:
-    - energy
-    - health
-    - score
+  # state_keys:
+  #   - energy
+  #   - health
+  #   - score
   batch_size: 12
   crop_size: 256
   patch_size: 16
@@ -56,7 +58,7 @@ model:
   pred_embed_dim: 1024
   pred_is_frame_causal: true
   pred_num_heads: 16
-  action_embed_dim: 9
+  # action_embed_dim: 9
   uniform_power: true
   use_activation_checkpointing: true
   use_extrinsics: false

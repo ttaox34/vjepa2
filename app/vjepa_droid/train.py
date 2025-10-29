@@ -120,6 +120,8 @@ def main(args, resume_preempt=False):
     patch_size = cfgs_data.get("patch_size")
     frame_stride = cfgs_data.get("frame_stride")
     state_keys = cfgs_data.get("state_keys")
+    action_mappings = cfgs_data.get("action_mappings")
+    manifest_paths = cfgs_data.get("manifest_paths")
     pin_mem = cfgs_data.get("pin_mem", False)
     num_workers = cfgs_data.get("num_workers", 1)
     persistent_workers = cfgs_data.get("persistent_workers", True)
@@ -173,8 +175,10 @@ def main(args, resume_preempt=False):
     # -- set device
     if not torch.cuda.is_available():
         device = torch.device("cpu")
+        local_rank = 0
     else:
-        device = torch.device("cuda:0")
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        device = torch.device(f"cuda:{local_rank}")
         torch.cuda.set_device(device)
 
     # -- log/checkpointing paths
@@ -196,8 +200,60 @@ def main(args, resume_preempt=False):
         mode="+a",
     )
 
+    video_collator = torch.utils.data.default_collate
+    transform = make_transforms(
+        random_horizontal_flip=horizontal_flip,
+        random_resize_aspect_ratio=ar_range,
+        random_resize_scale=rr_scale,
+        reprob=reprob,
+        auto_augment=use_aa,
+        motion_shift=motion_shift,
+        crop_size=crop_size,
+    )
+
+    # -- init data-loaders/samplers
+    dataset, unsupervised_loader, unsupervised_sampler = init_data(
+        data_path=dataset_path,
+        retro_paths=datasets if dataset_type == "retro" else None,
+        batch_size=batch_size,
+        frames_per_clip=max_num_frames,
+        tubelet_size=tubelet_size,
+        fps=fps,
+        camera_views=camera_views,
+        camera_frame=camera_frame,
+        stereo_view=stereo_view,
+        transform=transform,
+        collator=video_collator,
+        num_workers=num_workers,
+        world_size=world_size,
+        pin_mem=pin_mem,
+        persistent_workers=persistent_workers,
+        rank=rank,
+        dataset_type=dataset_type,
+        action_dim=cfgs_model.get("action_embed_dim"),
+        state_keys=state_keys,
+        frame_stride=frame_stride,
+        manifest_paths=manifest_paths,
+        action_mappings=action_mappings,
+    )
+
+    dataset_action_dim = getattr(dataset, "action_dim", None)
+    detected_state_keys = getattr(dataset, "state_keys", None)
+    if dataset_type == "retro":
+        if state_keys is None and detected_state_keys is not None and rank == 0:
+            logger.info(f"Inferred state keys from dataset: {detected_state_keys}")
+    action_embed_dim = cfgs_model.get("action_embed_dim")
+    if action_embed_dim is None:
+        action_embed_dim = dataset_action_dim or 7
+        if rank == 0:
+            logger.info(f"Inferred action embedding dim from dataset: {action_embed_dim}")
+    elif dataset_action_dim is not None and action_embed_dim != dataset_action_dim and rank == 0:
+        logger.warning(
+            f"Configured action_embed_dim ({action_embed_dim}) differs from dataset action_dim ({dataset_action_dim}); "
+            "sequences will be padded or truncated accordingly."
+        )
+
     # -- init model
-    action_embed_dim = cfgs_model.get("action_embed_dim", 7)
     model_num_frames = max_num_frames * max(1, tubelet_size)
     encoder, predictor = init_video_model(
         uniform_power=uniform_power,
@@ -228,41 +284,6 @@ def main(args, resume_preempt=False):
         encoder.compile()
         target_encoder.compile()
         predictor.compile()
-
-    video_collator = torch.utils.data.default_collate
-    transform = make_transforms(
-        random_horizontal_flip=horizontal_flip,
-        random_resize_aspect_ratio=ar_range,
-        random_resize_scale=rr_scale,
-        reprob=reprob,
-        auto_augment=use_aa,
-        motion_shift=motion_shift,
-        crop_size=crop_size,
-    )
-
-    # -- init data-loaders/samplers
-    (unsupervised_loader, unsupervised_sampler) = init_data(
-        data_path=dataset_path,
-        retro_paths=datasets if dataset_type == "retro" else None,
-        batch_size=batch_size,
-        frames_per_clip=max_num_frames,
-        tubelet_size=tubelet_size,
-        fps=fps,
-        camera_views=camera_views,
-        camera_frame=camera_frame,
-        stereo_view=stereo_view,
-        transform=transform,
-        collator=video_collator,
-        num_workers=num_workers,
-        world_size=world_size,
-        pin_mem=pin_mem,
-        persistent_workers=persistent_workers,
-        rank=rank,
-        dataset_type=dataset_type,
-        action_dim=action_embed_dim,
-        state_keys=state_keys,
-        frame_stride=frame_stride,
-    )
     _dlen = len(unsupervised_loader)
     if ipe is None:
         ipe = _dlen
