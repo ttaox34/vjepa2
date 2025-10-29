@@ -48,6 +48,7 @@ def init_data(
     state_keys=None,
     frame_stride=None,
     manifest_paths=None,
+    action_mappings=None,
 ):
     dataset_type = (dataset_type or "droid").lower()
     drop_last = drop_last if dataset_type != "retro" else False
