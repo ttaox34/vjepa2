@@ -58,6 +58,12 @@ def parse_args():
     parser.add_argument("--log-every", type=int, default=5000)
     parser.add_argument("--stats-output", type=str, default=None, help="Optional JSON file for summary stats.")
     parser.add_argument("--num-workers", type=int, default=1, help="Thread pool size for image/JSON decoding.")
+    parser.add_argument(
+        "--keep-map-output",
+        type=str,
+        default=None,
+        help="Optional JSON file to store {json_path: keep_bool} mapping.",
+    )
     return parser.parse_args()
 
 
@@ -110,6 +116,8 @@ def main():
         "episodes_written": 0,
     }
 
+    keep_map = {} if args.keep_map_output else None
+
     episode_id = 0
     prev_entry = None
     force_new_episode = False
@@ -134,17 +142,10 @@ def main():
                 def iter_results():
                     if args.num_workers and args.num_workers > 1:
                         with concurrent.futures.ThreadPoolExecutor(max_workers=args.num_workers) as executor:
-                            futures = [
-                                executor.submit(
-                                    process_step,
-                                    path,
-                                    args.downsample,
-                                    args.dark_pixel_threshold,
-                                )
-                                for path in json_files
-                            ]
-                            for future in concurrent.futures.as_completed(futures):
-                                yield future.result()
+                            yield from executor.map(
+                                lambda p: process_step(p, args.downsample, args.dark_pixel_threshold),
+                                json_files,
+                            )
                     else:
                         for json_path in json_files:
                             yield process_step(json_path, args.downsample, args.dark_pixel_threshold)
@@ -168,6 +169,9 @@ def main():
 
                     dark_frame = (mean <= args.dark_mean and std <= args.dark_std) or (dark_ratio >= args.dark_ratio)
                     drop_dark = dark_frame and (args.drop_zero_action_dark or not zero_action)
+                    keep_flag = not drop_dark
+                    if keep_map is not None:
+                        keep_map[str(json_path)] = keep_flag
                     if drop_dark:
                         stats["frames_dropped_dark"] += 1
                         if prev_entry is not None:
@@ -216,6 +220,12 @@ def main():
         stats_path.parent.mkdir(parents=True, exist_ok=True)
         with stats_path.open("w", encoding="utf-8") as f:
             json.dump(stats, f, indent=2)
+
+    if keep_map is not None:
+        keep_path = Path(args.keep_map_output).expanduser().resolve()
+        keep_path.parent.mkdir(parents=True, exist_ok=True)
+        with keep_path.open("w", encoding="utf-8") as f:
+            json.dump(keep_map, f)
 
 
 if __name__ == "__main__":
