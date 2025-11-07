@@ -92,6 +92,7 @@ def build_dataset(
     action_dim: Optional[int],
     manifest_paths: Optional[Sequence[str]] = None,
     action_mappings: Optional[Sequence[str]] = None,
+    include_returns: bool = False,
 ):
     dataset = RetroGameDataset(
         data_paths=data_paths,
@@ -102,6 +103,7 @@ def build_dataset(
         state_keys=None,
         manifest_paths=manifest_paths,
         action_mappings=action_mappings,
+        include_returns=include_returns,
     )
     return dataset
 
@@ -134,15 +136,15 @@ def predictor_step(predictor, z_context, actions, states, extrinsics, normalize,
     return z_hat
 
 
-def save_per_frame(values: List[Tuple[int, int, float]], path: Path, header: str = "index,batch,loss"):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as f:
+def save_metric_csv(dest_dir: Path, name: str, values: List[Tuple[int, int, float]], header: str):
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    with (dest_dir / f"{name}.csv").open("w", encoding="utf-8") as f:
         f.write(header + "\n")
         for global_idx, batch_idx, val in values:
             f.write(f"{global_idx},{batch_idx},{val}\n")
 
 
-def evaluate_prediction_loss(args):
+def evaluate_metrics(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     cfg = yaml.safe_load(Path(args.fname).read_text())
     transform = make_eval_transform(cfg["data"]["crop_size"])
@@ -165,69 +167,13 @@ def evaluate_prediction_loss(args):
     normalize_reps = cfg["loss"].get("normalize_reps", False)
     tokens_per_frame = int((crop_size // patch_size) ** 2)
 
-    total_loss = 0.0
+    total_l1 = 0.0
+    total_mse = 0.0
+    total_cos = 0.0
     total_count = 0
-    per_frame: List[Tuple[int, int, float]] = []
-    global_idx = 0
-    with torch.no_grad():
-        for batch_idx, batch in enumerate(loader):
-            clips = batch[0].to(device)
-            actions = batch[1].to(device, dtype=torch.float32)
-            states = batch[2].to(device, dtype=torch.float32)
-            extrinsics = batch[3].to(device, dtype=torch.float32)
-
-            h = encode_clip(encoder, clips, max_num_frames, tokens_per_frame, tubelet_size)
-            z_context = h[:, :-tokens_per_frame, :]
-            z_target = h[:, tokens_per_frame:, :]
-            if normalize_reps:
-                z_target = F.layer_norm(z_target, (z_target.size(-1),))
-            z_hat = predictor_step(predictor, z_context, actions, states[:, :-1], extrinsics[:, :-1], normalize_reps, tokens_per_frame)
-
-            diff = torch.abs(z_hat - z_target)
-            frame_loss = diff.mean(dim=-1)  # [B, T]
-            total_loss += frame_loss.sum().item()
-            total_count += frame_loss.numel()
-            per_frame.extend(
-                (global_idx + i, batch_idx, float(val))
-                for i, val in enumerate(frame_loss.flatten().cpu().tolist())
-            )
-            global_idx += frame_loss.numel()
-
-    avg_loss = total_loss / max(total_count, 1)
-    logger.info(f"Prediction L1 loss over dataset: {avg_loss:.6f}")
-    if args.output:
-        Path(args.output).parent.mkdir(parents=True, exist_ok=True)
-        Path(args.output).write_text(f"{avg_loss}\n")
-    if args.per_frame_output:
-        save_per_frame(per_frame, Path(args.per_frame_output))
-
-
-def evaluate_prediction_cosine(args):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    cfg = yaml.safe_load(Path(args.fname).read_text())
-    transform = make_eval_transform(cfg["data"]["crop_size"])
-
-    dataset = build_dataset(
-        args.datasets,
-        frames_per_clip=2,
-        transform=transform,
-        action_dim=None,
-        manifest_paths=args.manifest,
-        action_mappings=args.action_mappings,
-    )
-    inferred_action_dim = dataset.action_dim
-    logger.info(f"Dataset action dimension: {inferred_action_dim}")
-
-    loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=True)
-    encoder, predictor, crop_size, patch_size, tubelet_size, max_num_frames = load_models(
-        cfg, inferred_action_dim, device, args.checkpoint
-    )
-    normalize_reps = cfg["loss"].get("normalize_reps", False)
-    tokens_per_frame = int((crop_size // patch_size) ** 2)
-
-    total_sim = 0.0
-    total_count = 0
-    per_frame: List[Tuple[int, int, float]] = []
+    per_frame_l1: List[Tuple[int, int, float]] = []
+    per_frame_mse: List[Tuple[int, int, float]] = []
+    per_frame_cos: List[Tuple[int, int, float]] = []
     global_idx = 0
     with torch.no_grad():
         for batch_idx, batch in enumerate(loader):
@@ -245,22 +191,38 @@ def evaluate_prediction_cosine(args):
                 predictor, z_context, actions, states[:, :-1], extrinsics[:, :-1], normalize_reps, tokens_per_frame
             )
 
-            cos = F.cosine_similarity(z_hat, z_target, dim=-1)  # [B, T]
-            total_sim += cos.sum().item()
-            total_count += cos.numel()
-            per_frame.extend(
-                (global_idx + i, batch_idx, float(val))
-                for i, val in enumerate(cos.flatten().cpu().tolist())
-            )
-            global_idx += cos.numel()
+            diff = z_hat - z_target
+            l1 = diff.abs().mean(dim=-1)
+            mse = (diff**2).mean(dim=-1)
+            cos = F.cosine_similarity(z_hat, z_target, dim=-1)
 
-    avg_sim = total_sim / max(total_count, 1)
-    logger.info(f"Prediction cosine similarity over dataset: {avg_sim:.6f}")
-    if args.output:
-        Path(args.output).parent.mkdir(parents=True, exist_ok=True)
-        Path(args.output).write_text(f"{avg_sim}\n")
-    if args.per_frame_output:
-        save_per_frame(per_frame, Path(args.per_frame_output), header="index,batch,cosine")
+            total_l1 += l1.sum().item()
+            total_mse += mse.sum().item()
+            total_cos += cos.sum().item()
+            total_count += l1.numel()
+
+            l1_vals = l1.flatten().cpu().tolist()
+            mse_vals = mse.flatten().cpu().tolist()
+            cos_vals = cos.flatten().cpu().tolist()
+            per_frame_l1.extend((global_idx + i, batch_idx, float(v)) for i, v in enumerate(l1_vals))
+            per_frame_mse.extend((global_idx + i, batch_idx, float(v)) for i, v in enumerate(mse_vals))
+            per_frame_cos.extend((global_idx + i, batch_idx, float(v)) for i, v in enumerate(cos_vals))
+            global_idx += l1.numel()
+
+    denom = max(total_count, 1)
+    avg_l1 = total_l1 / denom
+    avg_mse = total_mse / denom
+    avg_cos = total_cos / denom
+    logger.info(f"Prediction L1 loss: {avg_l1:.6f} | MSE: {avg_mse:.6f} | Cosine: {avg_cos:.6f}")
+
+    output_dir = Path(args.output_dir)
+    summary = output_dir / "metrics.txt"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    summary.write_text(f"l1={avg_l1}\nmse={avg_mse}\ncosine={avg_cos}\n")
+
+    save_metric_csv(output_dir, "l1", per_frame_l1, "index,batch,l1")
+    save_metric_csv(output_dir, "mse", per_frame_mse, "index,batch,mse")
+    save_metric_csv(output_dir, "cosine", per_frame_cos, "index,batch,cosine")
 
 
 def collect_unique_actions(dataset: RetroGameDataset, max_actions: Optional[int] = None) -> List[Tuple[int, ...]]:
@@ -341,7 +303,7 @@ def evaluate_energy_landscape(args):
     tokens_per_frame = int((crop_size // patch_size) ** 2)
 
     sample_idx = min(args.sample_index, len(dataset) - 1)
-    clips, actions_true, states, extrinsics, _ = dataset[sample_idx]
+    clips, actions_true, states, extrinsics, rewards, _ = dataset[sample_idx]
     clips = clips.unsqueeze(0).to(device)
     actions_true = torch.tensor(actions_true, dtype=torch.float32, device=device).unsqueeze(0)
     states = torch.tensor(states, dtype=torch.float32, device=device).unsqueeze(0)
@@ -381,38 +343,21 @@ def evaluate_energy_landscape(args):
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Retro predictor evaluation utilities")
+    shared = argparse.ArgumentParser(add_help=False)
+    shared.add_argument("--fname", required=True, help="Training config YAML used during training.")
+    shared.add_argument("--checkpoint", required=True, help="Path to the trained checkpoint (latest.pt).")
+    shared.add_argument("--datasets", nargs="+", required=True, help="Test dataset directories or glob patterns.")
+    shared.add_argument("--manifest", nargs="*", default=None, help="Optional manifest JSONL files.")
+    shared.add_argument("--action-mappings", nargs="*", default=None, help="Optional action mapping JSON files.")
+
     subparsers = parser.add_subparsers(dest="mode", required=True)
 
-    base = argparse.ArgumentParser(add_help=False)
-    base.add_argument("--fname", required=True, help="Training config YAML used during training.")
-    base.add_argument("--checkpoint", required=True, help="Path to the trained checkpoint (latest.pt).")
-    base.add_argument("--datasets", nargs="+", required=True, help="Test dataset directories or glob patterns.")
-    base.add_argument("--manifest", nargs="*", default=None, help="Optional manifest JSONL files.")
-    base.add_argument("--action-mappings", nargs="*", default=None, help="Optional action mapping JSON files.")
-
-    pred = subparsers.add_parser("prediction_loss", parents=[base], help="Compute average prediction loss.")
+    pred = subparsers.add_parser("prediction", parents=[shared], help="Compute L1, MSE, and cosine metrics.")
     pred.add_argument("--batch-size", type=int, default=8)
     pred.add_argument("--num-workers", type=int, default=4)
-    pred.add_argument("--output", type=str, default=None, help="Optional path to write the scalar loss.")
-    pred.add_argument(
-        "--per-frame-output",
-        type=str,
-        default=None,
-        help="Optional CSV to store per-frame losses (columns: index,batch,loss).",
-    )
+    pred.add_argument("--output-dir", type=str, required=True, help="Directory to store metric CSVs and summary.")
 
-    cos = subparsers.add_parser("prediction_cosine", parents=[base], help="Compute cosine similarity metrics.")
-    cos.add_argument("--batch-size", type=int, default=8)
-    cos.add_argument("--num-workers", type=int, default=4)
-    cos.add_argument("--output", type=str, default=None, help="Optional path to write the scalar similarity.")
-    cos.add_argument(
-        "--per-frame-output",
-        type=str,
-        default=None,
-        help="Optional CSV to store per-frame cosine similarities (columns: index,batch,cosine).",
-    )
-
-    energy = subparsers.add_parser("energy_landscape", parents=[base], help="Compute action energy landscape.")
+    energy = subparsers.add_parser("energy_landscape", parents=[shared], help="Compute action energy landscape.")
     energy.add_argument("--sample-index", type=int, default=0, help="Dataset sample index to visualize.")
     energy.add_argument("--max-actions", type=int, default=None, help="Optional limit on unique actions collected.")
     energy.add_argument("--output", type=str, default=None, help="Optional CSV output for (action, energy).")
@@ -423,9 +368,7 @@ def parse_args():
 
 if __name__ == "__main__":
     args = parse_args()
-    if args.mode == "prediction_loss":
-        evaluate_prediction_loss(args)
-    elif args.mode == "prediction_cosine":
-        evaluate_prediction_cosine(args)
+    if args.mode == "prediction":
+        evaluate_metrics(args)
     elif args.mode == "energy_landscape":
         evaluate_energy_landscape(args)

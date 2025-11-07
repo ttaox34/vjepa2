@@ -427,9 +427,10 @@ def main(args, resume_preempt=False):
                 actions = sample[1].to(device, dtype=torch.float, non_blocking=True)  # [B T-1 7]
                 states = sample[2].to(device, dtype=torch.float, non_blocking=True)  # [B T 7]
                 extrinsics = sample[3].to(device, dtype=torch.float, non_blocking=True)  # [B T 7]
-                return (clips, actions, states, extrinsics)
+                rewards = sample[4].to(device, dtype=torch.float, non_blocking=True)  # [B T]
+                return (clips, actions, states, extrinsics, rewards)
 
-            clips, actions, states, extrinsics = load_clips()
+            clips, actions, states, extrinsics, _ = load_clips()
             data_elapsed_time_ms = (time.time() - itr_start_time) * 1000.0
 
             if sync_gc and (itr + 1) % GARBAGE_COLLECT_ITR_FREQ == 0:

@@ -166,7 +166,8 @@ class DROIDVideoDataset(torch.utils.data.Dataset):
                 index = np.random.randint(self.__len__())
                 path = self.samples[index]
 
-        return buffer, actions, states, extrinsics, indices
+        rewards = np.zeros((self.frames_per_clip,), dtype=np.float32)
+        return buffer, actions, states, extrinsics, rewards, indices
 
     def poses_to_diffs(self, poses):
         xyz = poses[:, :3]  # shape [T, 3]

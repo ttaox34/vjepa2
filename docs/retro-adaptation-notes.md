@@ -6,7 +6,8 @@ This repository now supports training V-JEPA 2 and V-JEPA 2-AC models on retro g
 - `app/vjepa_droid/game_dataset.py`: New dataset class that scans one or more folders (or glob patterns) containing `step_*.json`/`step_*.png` files, constructs sliding windows, and pads or trims actions/states so every clip has consistent shapes. It also supports per-game action remapping via JSON mapping files so multiple games can share a common "mega" action vector.
 - `app/vjepa_droid/droid.py`: `init_data` now switches between the DROID loader and the new retro dataset. It logs clip counts, validates that trajectories exist, and honours parameters such as `frame_stride`, `state_keys`, and `action_dim`.
 - `tools/retro_preprocess.py`: Optional offline cleaner that scans raw retro dumps, detects dark screens (while keeping legitimate "no-action" pauses), and emits a manifest describing which frames to keep and where each episode terminates. Training consumes the manifest instead of touching the raw PNG/JSON files.
-- `tools/plot_metric_boxplot.py`: Utility that reads the per-frame metric CSVs produced by evaluation scripts and draws comparative box plots (useful when benchmarking multiple checkpoints or games).
+- `tools/plot_metric_boxplot.py`: Utility that reads the per-frame metric CSVs produced by evaluation scripts and draws comparative box (or violin) plots (useful when benchmarking multiple checkpoints or games).
+- `tools/train_reward_head.py`: Freezes the trained encoder/predictor, extracts latent features for each transition, and fits a small MLP to predict per-step rewards (using the rewards stored in the JSON trajectories). The resulting head can be reused as a lightweight reward model for downstream agents.
 - `configs/train/vitl16/game-retro-256px-8f.yaml`: Example configuration for training a ViT-L AC model on retro data. It shows how to point at multiple directories, set action/state dimensions, and reuse pretrained checkpoints.
 
 ## Training Pipeline
@@ -58,6 +59,37 @@ python tools/plot_metric_boxplot.py \
 ```
 
 Change `--value-column` to `cosine` when visualising cosine similarity CSVs.
+
+### Training a Reward Head
+
+To learn a standalone reward predictor on top of a frozen V-JEPA AC model:
+
+```
+python tools/train_reward_head.py \
+  --fname configs/train/vitl16/game-retro-256px-8f.yaml \
+  --checkpoint /path/to/ac_checkpoint.pt \
+  --datasets /path/to/retro/data \
+  --manifest /path/to/retro/manifest.jsonl \
+  --action-mappings /path/to/retro/action_map.json \
+  --epochs 5 --batch-size 64 --frames-per-clip 2 \
+  --num-workers 8 --prefetch-factor 4 --persistent-workers --logdir runs/reward_head
+```
+
+By default the head trains on predicted latents; pass `--use-target` to learn from ground-truth latents. With `--mode value` (and optional `--discount`), the target becomes a discounted return, which is usually more stable for sparse rewards. The dataset must contain per-frame `reward` fields in the JSON files.
+
+For multi-GPU acceleration, launch via `torchrun` (freeze the encoder/predictor while training a distributed head):
+
+```
+torchrun --nnodes=1 --nproc_per_node=4 tools/train_reward_head.py \
+  --fname configs/train/vitl16/game-retro-256px-8f.yaml \
+  --checkpoint /path/to/ac_checkpoint.pt \
+  --datasets /path/to/retro/data \
+  --manifest /path/to/retro/manifest.jsonl \
+  --action-mappings /path/to/retro/action_map.json \
+  --epochs 5 --batch-size 256 --num-workers 8 --prefetch-factor 4 --persistent-workers --logdir runs/reward_head
+```
+
+When training on many games, consider using a dataset config (see `configs/reward/multi_game_example.yaml`) and pass it via `--data-config`. Each entry lists raw data folders plus matching manifest/action mapping files, allowing the script to construct a unified dataset automatically. Checkpoints (including `latest.pt`) are written to `--logdir/checkpoints`; pass `--resume` to continue from the most recent epoch.
 
 ### Action Mapping File Format
 

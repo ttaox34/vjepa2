@@ -43,6 +43,7 @@ class ActionMapper:
             raise ValueError("Mapping length does not match raw_dim")
 
         self.target_groups: List[List[int]] = [[] for _ in range(global_dim)]
+        self.source_to_targets: List[List[int]] = [list(targets) for targets in mapping_per_source]
         for src_idx, targets in enumerate(mapping_per_source):
             for tgt in targets:
                 if tgt < 0:
@@ -130,6 +131,7 @@ class RetroGameDataset(torch.utils.data.Dataset):
         default_state_value: float = 0.0,
         manifest_paths: Optional[Sequence[str]] = None,
         action_mappings: Optional[Sequence[Optional[str]]] = None,
+        include_returns: bool = False,
     ):
         if frames_per_clip < 2:
             raise ValueError("frames_per_clip must be >= 2 for action-conditioned training.")
@@ -139,10 +141,12 @@ class RetroGameDataset(torch.utils.data.Dataset):
         self.frame_stride = max(1, frame_stride)
         self.default_state_value = default_state_value
         self.state_keys = list(state_keys) if state_keys is not None else None
+        self.include_returns = include_returns
 
         self.global_action_dim: Optional[int] = action_dim
         self.episodes: List[_Episode] = []
         self.indices: List[Tuple[int, int]] = []
+        self.discounted_returns: Dict[str, float] = {}
 
         dataset_paths = list(data_paths) if data_paths else []
         manifest_paths = list(manifest_paths) if manifest_paths else []
@@ -208,6 +212,8 @@ class RetroGameDataset(torch.utils.data.Dataset):
                 images: List[np.ndarray] = []
                 states: List[np.ndarray] = []
                 actions: List[np.ndarray] = []
+                rewards: List[float] = []
+                returns: List[float] = []
 
                 for i, step_path in enumerate(step_files):
                     data = self._load_step(step_path, episode.mapper)
@@ -215,6 +221,8 @@ class RetroGameDataset(torch.utils.data.Dataset):
                     states.append(data["state"])
                     if i < len(step_files) - 1:
                         actions.append(data["action"])
+                    rewards.append(data["reward"])
+                    returns.append(data.get("discounted_return", 0.0))
 
                 def _stack(values: List[np.ndarray], target_len: int) -> np.ndarray:
                     if values:
@@ -228,8 +236,22 @@ class RetroGameDataset(torch.utils.data.Dataset):
                         arr = arr[:target_len]
                     return arr
 
+                def _stack_rewards(values: List[float], target_len: int) -> np.ndarray:
+                    if values:
+                        arr = np.array(values, dtype=np.float32)
+                    else:
+                        arr = np.zeros((0,), dtype=np.float32)
+                    if arr.shape[0] < target_len:
+                        pad = np.zeros((target_len - arr.shape[0],), dtype=np.float32)
+                        arr = np.concatenate([arr, pad], axis=0)
+                    elif arr.shape[0] > target_len:
+                        arr = arr[:target_len]
+                    return arr
+
                 states_arr = _stack(states, self.frames_per_clip)
                 actions_arr = _stack(actions, self.frames_per_clip - 1 if self.frames_per_clip > 0 else 0)
+                rewards_arr = _stack_rewards(rewards, self.frames_per_clip)
+                returns_arr = _stack_rewards(returns, self.frames_per_clip)
                 extrinsics = np.zeros_like(states_arr, dtype=np.float32)
                 indices = np.arange(start_idx, start_idx + stride * self.frames_per_clip, stride, dtype=np.int64)
 
@@ -237,7 +259,9 @@ class RetroGameDataset(torch.utils.data.Dataset):
                 if self.transform is not None:
                     buffer = self.transform(buffer)
 
-                return buffer, actions_arr, states_arr, extrinsics, indices
+                if self.include_returns:
+                    return buffer, actions_arr, states_arr, extrinsics, rewards_arr, returns_arr, indices
+                return buffer, actions_arr, states_arr, extrinsics, rewards_arr, indices
             except Exception:
                 index = np.random.randint(len(self))
                 if attempt == max_retries - 1:
@@ -302,6 +326,7 @@ class RetroGameDataset(torch.utils.data.Dataset):
                 if json_path is None:
                     continue
                 json_path = str(_resolve_path(base, json_path))
+                self.discounted_returns[json_path] = float(record.get("discounted_return", 0.0))
 
                 episode_id = record.get("episode_id")
                 terminated = bool(record.get("terminated", False))
@@ -376,6 +401,7 @@ class RetroGameDataset(torch.utils.data.Dataset):
         image_array = np.array(image, dtype=np.uint8)
 
         raw_action = np.asarray(data.get("action", []), dtype=np.float32)
+        reward_val = float(data.get("reward", 0.0))
         if mapper is not None:
             action_vec = mapper.map(raw_action)
             self.global_action_dim = mapper.global_dim
@@ -388,8 +414,12 @@ class RetroGameDataset(torch.utils.data.Dataset):
 
         state_vec = np.zeros((self.global_action_dim,), dtype=np.float32)
 
+        discounted_return = float(self.discounted_returns.get(str(json_file), 0.0))
+
         return {
             "image": image_array,
             "action": action_vec,
             "state": state_vec,
+            "reward": reward_val,
+            "discounted_return": discounted_return,
         }

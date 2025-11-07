@@ -8,11 +8,31 @@ import concurrent.futures
 import json
 import os
 from pathlib import Path
-from typing import Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 from PIL import Image
-from concurrent.futures import ThreadPoolExecutor, as_completed
+
+from app.vjepa_droid.game_dataset import ActionMapper
+
+try:
+    from tqdm import tqdm  # type: ignore
+except ImportError:  # pragma: no cover
+    class tqdm:  # type: ignore
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def update(self, n=1):
+            pass
+
+        def close(self):
+            pass
 
 
 def find_step_directories(root: Path) -> List[Path]:
@@ -41,8 +61,8 @@ def compute_metrics(image_path: Path, downsample: int, dark_pixel_threshold: flo
     return mean, std, dark_ratio
 
 
-def action_is_zero(action: List[float], epsilon: float = 1e-9) -> bool:
-    return all(abs(v) <= epsilon for v in action)
+def action_is_zero(action: Sequence[float], epsilon: float = 1e-9) -> bool:
+    return all(abs(float(v)) <= epsilon for v in action)
 
 
 def parse_args():
@@ -63,6 +83,52 @@ def parse_args():
         type=str,
         default=None,
         help="Optional JSON file to store {json_path: keep_bool} mapping.",
+    )
+    parser.add_argument(
+        "--action-mapping",
+        type=str,
+        default=None,
+        help="Optional action mapping JSON (raw->global) to drop frames that use ignored buttons.",
+    )
+    parser.add_argument(
+        "--disable-action-filter",
+        action="store_true",
+        help="Skip dropping frames based on action mapping even if one is provided.",
+    )
+    parser.add_argument(
+        "--none-index",
+        type=int,
+        default=0,
+        help="Global index representing a 'none' action in the mapping. Raw buttons mapped only here trigger drops when active.",
+    )
+    parser.add_argument(
+        "--action-epsilon",
+        type=float,
+        default=1e-6,
+        help="Tolerance when deciding if a raw action component should be considered non-zero.",
+    )
+    parser.add_argument(
+        "--discount",
+        type=float,
+        default=0.99,
+        help="Discount factor used when precomputing episode returns.",
+    )
+    parser.add_argument(
+        "--value-map-output",
+        type=str,
+        default=None,
+        help="Optional JSON file to store per-frame discounted returns {json_path: value}.",
+    )
+    parser.add_argument(
+        "--min-episode-length",
+        type=int,
+        default=0,
+        help="Minimum number of kept frames required to keep an episode. Shorter segments are discarded.",
+    )
+    parser.add_argument(
+        "--no-progress",
+        action="store_true",
+        help="Disable progress bars during preprocessing.",
     )
     return parser.parse_args()
 
@@ -90,8 +156,10 @@ def process_step(
         return None
 
     mean, std, dark_ratio = compute_metrics(image_path, downsample, dark_pixel_threshold)
-    zero_action = action_is_zero(metadata.get("action", []))
+    raw_action = metadata.get("action", [])
+    zero_action = action_is_zero(raw_action)
     terminated = bool(metadata.get("terminated") or metadata.get("truncated"))
+    reward = float(metadata.get("reward", 0.0))
 
     return {
         "json_path": json_path,
@@ -100,7 +168,18 @@ def process_step(
         "dark_ratio": dark_ratio,
         "zero_action": zero_action,
         "terminated": terminated,
+        "raw_action": raw_action,
+        "reward": reward,
     }
+
+
+def build_drop_indices(mapper: ActionMapper, none_index: int) -> Tuple[int, ...]:
+    drop_list: List[int] = []
+    for raw_idx, targets in enumerate(mapper.source_to_targets):
+        valid_targets = [t for t in targets if t >= 0]
+        if not valid_targets or all(t == none_index for t in valid_targets):
+            drop_list.append(raw_idx)
+    return tuple(drop_list)
 
 
 def main():
@@ -109,26 +188,38 @@ def main():
     output_path = Path(args.output).expanduser().resolve()
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    stats = {
+    mapper: Optional[ActionMapper] = None
+    drop_indices: Tuple[int, ...] = ()
+    if args.action_mapping:
+        mapping_path = Path(args.action_mapping).expanduser().resolve()
+        mapper = ActionMapper.from_file(mapping_path, global_dim=None)
+        drop_indices = build_drop_indices(mapper, args.none_index)
+        print(
+            f"[retro_preprocess] action mapping loaded ({mapper.raw_dim}->{mapper.global_dim}); "
+            f"{len(drop_indices)} raw indices flagged as drop-if-active."
+        )
+        if args.disable_action_filter:
+            drop_indices = ()
+            print("[retro_preprocess] action filtering disabled; no frames will be dropped due to action mapping.")
+
+    stats: Dict[str, int] = {
         "frames_seen": 0,
         "frames_kept": 0,
         "frames_dropped_dark": 0,
+        "frames_dropped_action": 0,
         "episodes_written": 0,
+        "episodes_dropped_short": 0,
     }
 
     keep_map = {} if args.keep_map_output else None
+    value_map = {} if args.value_map_output else None
 
     episode_id = 0
-    prev_entry = None
-    force_new_episode = False
+    true_episode_buffer: List[Dict[str, object]] = []
 
-    def flush_prev(out_file):
-        nonlocal prev_entry, stats
-        if prev_entry is not None:
-            out_file.write(json.dumps(prev_entry) + "\n")
-            if prev_entry.get("terminated"):
-                stats["episodes_written"] += 1
-            prev_entry = None
+    def mark_keep(path_str: str, keep: bool):
+        if keep_map is not None:
+            keep_map[path_str] = keep
 
     with output_path.open("w", encoding="utf-8") as outfile:
         for root in roots:
@@ -137,7 +228,61 @@ def main():
                 json_files = list(iter_steps(directory))
                 if not json_files:
                     continue
-                force_new_episode = False
+
+                true_episode_buffer = []
+                current_segment: List[dict] = []
+                pending_segments: List[List[dict]] = []
+
+                def close_current_segment(force_terminate_last: bool = False):
+                    nonlocal current_segment, pending_segments
+                    if not current_segment:
+                        return
+                    if force_terminate_last and not current_segment[-1]["terminated"]:
+                        current_segment[-1]["terminated"] = True
+                        current_segment[-1]["forced_termination"] = True
+                    pending_segments.append(current_segment)
+                    current_segment = []
+
+                def finalize_true_episode():
+                    nonlocal pending_segments, true_episode_buffer, episode_id
+                    if not pending_segments:
+                        true_episode_buffer = []
+                        return
+
+                    returns_map: Dict[int, float] = {}
+                    future = 0.0
+                    for record in reversed(true_episode_buffer):
+                        reward_val = float(record["reward"])
+                        future = reward_val + args.discount * future
+                        entry = record.get("entry")
+                        if entry is not None:
+                            returns_map[id(entry)] = future
+
+                    for segment in pending_segments:
+                        episode_length = len(segment)
+                        if episode_length < args.min_episode_length:
+                            stats["episodes_dropped_short"] += 1
+                            for entry in segment:
+                                mark_keep(entry["json_path"], False)
+                            continue
+
+                        if not segment[-1]["terminated"]:
+                            segment[-1]["terminated"] = True
+
+                        for entry in segment:
+                            entry["episode_id"] = episode_id
+                            value = float(returns_map.get(id(entry), 0.0))
+                            entry["discounted_return"] = value
+                            if value_map is not None:
+                                value_map[entry["json_path"]] = value
+                            outfile.write(json.dumps(entry) + "\n")
+                            mark_keep(entry["json_path"], True)
+                        stats["frames_kept"] += episode_length
+                        stats["episodes_written"] += 1
+                        episode_id += 1
+
+                    pending_segments = []
+                    true_episode_buffer = []
 
                 def iter_results():
                     if args.num_workers and args.num_workers > 1:
@@ -150,70 +295,80 @@ def main():
                         for json_path in json_files:
                             yield process_step(json_path, args.downsample, args.dark_pixel_threshold)
 
-                for result in iter_results():
-                    if result is None:
-                        continue
-                    json_path = result["json_path"]
-                    mean = result["mean"]
-                    std = result["std"]
-                    dark_ratio = result["dark_ratio"]
-                    zero_action = result["zero_action"]
-                    terminated_flag = result["terminated"]
+                with tqdm(
+                    total=len(json_files),
+                    desc=str(directory),
+                    disable=args.no_progress or len(json_files) == 0,
+                ) as progress:
+                    for result in iter_results():
+                        progress.update(1)
+                        if result is None:
+                            continue
+                        json_path = result["json_path"]
+                        mean = result["mean"]
+                        std = result["std"]
+                        dark_ratio = result["dark_ratio"]
+                        zero_action = result["zero_action"]
+                        terminated_flag = result["terminated"]
+                        raw_action = result["raw_action"]
+                        reward = float(result["reward"])
 
-                    stats["frames_seen"] += 1
-                    if stats["frames_seen"] % args.log_every == 0:
-                        print(
-                            f"[retro_preprocess] processed {stats['frames_seen']} frames "
-                            f"(kept={stats['frames_kept']}, dropped_dark={stats['frames_dropped_dark']})"
-                        )
+                        stats["frames_seen"] += 1
+                        # if stats["frames_seen"] % args.log_every == 0:
+                        #     print(
+                        #         f"[retro_preprocess] processed {stats['frames_seen']} frames "
+                        #         f"(kept={stats['frames_kept']}, dropped_dark={stats['frames_dropped_dark']}, "
+                        #         f"dropped_action={stats['frames_dropped_action']})"
+                        #     )
 
-                    dark_frame = (mean <= args.dark_mean and std <= args.dark_std) or (dark_ratio >= args.dark_ratio)
-                    drop_dark = dark_frame and (args.drop_zero_action_dark or not zero_action)
-                    keep_flag = not drop_dark
-                    if keep_map is not None:
-                        keep_map[str(json_path)] = keep_flag
-                    if drop_dark:
-                        stats["frames_dropped_dark"] += 1
-                        if prev_entry is not None:
-                            prev_entry["terminated"] = True
-                            flush_prev(outfile)
-                        else:
-                            force_new_episode = True
-                        continue
+                        json_path_str = str(json_path)
+                        dark_frame = (mean <= args.dark_mean and std <= args.dark_std) or (dark_ratio >= args.dark_ratio)
+                        drop_dark = dark_frame and (args.drop_zero_action_dark or not zero_action)
+                        drop_action = False
+                        if not drop_dark and drop_indices:
+                            values = list(raw_action) if isinstance(raw_action, list) else []
+                            for idx in drop_indices:
+                                if idx < len(values) and abs(float(values[idx])) > args.action_epsilon:
+                                    drop_action = True
+                                    break
 
-                    if force_new_episode:
-                        episode_id += 1
-                        force_new_episode = False
+                        if drop_dark or drop_action:
+                            mark_keep(json_path_str, False)
+                            if drop_dark:
+                                stats["frames_dropped_dark"] += 1
+                            if drop_action:
+                                stats["frames_dropped_action"] += 1
+                            if current_segment:
+                                close_current_segment(force_terminate_last=True)
+                            true_episode_buffer.append({"json_path": json_path_str, "reward": reward, "entry": None})
+                            if drop_dark:
+                                finalize_true_episode()
+                            continue
 
-                    entry = {
-                        "json_path": str(json_path),
-                        "episode_id": episode_id,
-                        "keep": True,
-                        "terminated": False,
-                    }
-                    if not args.drop_zero_action_dark:
-                        entry["zero_action_dark_allowed"] = zero_action and dark_frame
-                    if terminated_flag:
-                        entry["terminated"] = True
-                        force_new_episode = True
+                        entry = {
+                            "json_path": json_path_str,
+                            "episode_id": None,
+                            "keep": True,
+                            "terminated": bool(terminated_flag),
+                            "forced_termination": False,
+                        }
+                        if not args.drop_zero_action_dark:
+                            entry["zero_action_dark_allowed"] = bool(zero_action and dark_frame)
 
-                    if prev_entry is not None:
-                        flush_prev(outfile)
-                    prev_entry = entry
-                    stats["frames_kept"] += 1
+                        current_segment.append(entry)
+                        true_episode_buffer.append({"json_path": json_path_str, "reward": reward, "entry": entry})
 
-                if prev_entry is not None:
-                    prev_entry["terminated"] = True
-                    flush_prev(outfile)
-                    episode_id += 1
+                        if entry["terminated"]:
+                            close_current_segment()
+                            finalize_true_episode()
 
-        if prev_entry is not None:
-            prev_entry["terminated"] = True
-            flush_prev(outfile)
+                close_current_segment(force_terminate_last=True)
+                finalize_true_episode()
 
     print(
         f"[retro_preprocess] done. seen={stats['frames_seen']} kept={stats['frames_kept']} "
-        f"dropped_dark={stats['frames_dropped_dark']} episodes={stats['episodes_written']}"
+        f"dropped_dark={stats['frames_dropped_dark']} dropped_action={stats['frames_dropped_action']} "
+        f"episodes={stats['episodes_written']} dropped_short={stats['episodes_dropped_short']}"
     )
     if args.stats_output:
         stats_path = Path(args.stats_output).expanduser().resolve()
@@ -226,6 +381,12 @@ def main():
         keep_path.parent.mkdir(parents=True, exist_ok=True)
         with keep_path.open("w", encoding="utf-8") as f:
             json.dump(keep_map, f)
+
+    if value_map is not None:
+        value_path = Path(args.value_map_output).expanduser().resolve()
+        value_path.parent.mkdir(parents=True, exist_ok=True)
+        with value_path.open("w", encoding="utf-8") as f:
+            json.dump(value_map, f)
 
 
 if __name__ == "__main__":
