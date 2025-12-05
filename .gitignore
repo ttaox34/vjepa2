@@ -33,3 +33,4 @@ configs/local
 
 output/
 checkpoints/
+latent/

@@ -120,6 +120,11 @@ def parse_args():
         help="Optional JSON file to store per-frame discounted returns {json_path: value}.",
     )
     parser.add_argument(
+        "--normalize-returns",
+        action="store_true",
+        help="Normalize discounted (value) targets per game so that max |return| is 1.",
+    )
+    parser.add_argument(
         "--min-episode-length",
         type=int,
         default=0,
@@ -221,6 +226,21 @@ def main():
         if keep_map is not None:
             keep_map[path_str] = keep
 
+    def flush_entries(entries, outfile, normalize, value_map):
+        if not entries:
+            return
+        factor = 1.0
+        if normalize:
+            max_abs = max(abs(entry.get("discounted_return", 0.0)) for entry in entries)
+            if max_abs > 0.0:
+                factor = 1.0 / max_abs
+        for entry in entries:
+            out_entry = dict(entry)
+            out_entry["discounted_return"] = float(out_entry.get("discounted_return", 0.0)) * factor
+            outfile.write(json.dumps(out_entry) + "\n")
+            if value_map is not None:
+                value_map[out_entry["json_path"]] = out_entry["discounted_return"]
+
     with output_path.open("w", encoding="utf-8") as outfile:
         for root in roots:
             directories = find_step_directories(root)
@@ -232,6 +252,7 @@ def main():
                 true_episode_buffer = []
                 current_segment: List[dict] = []
                 pending_segments: List[List[dict]] = []
+                directory_entries: List[dict] = []
 
                 def close_current_segment(force_terminate_last: bool = False):
                     nonlocal current_segment, pending_segments
@@ -273,9 +294,7 @@ def main():
                             entry["episode_id"] = episode_id
                             value = float(returns_map.get(id(entry), 0.0))
                             entry["discounted_return"] = value
-                            if value_map is not None:
-                                value_map[entry["json_path"]] = value
-                            outfile.write(json.dumps(entry) + "\n")
+                            directory_entries.append(dict(entry))
                             mark_keep(entry["json_path"], True)
                         stats["frames_kept"] += episode_length
                         stats["episodes_written"] += 1
@@ -364,6 +383,9 @@ def main():
 
                 close_current_segment(force_terminate_last=True)
                 finalize_true_episode()
+
+                flush_entries(directory_entries, outfile, args.normalize_returns, value_map)
+                directory_entries = []
 
     print(
         f"[retro_preprocess] done. seen={stats['frames_seen']} kept={stats['frames_kept']} "

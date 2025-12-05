@@ -1,27 +1,44 @@
 {
-    "game_name": "RoboWarrior-Nes",
-    "rl_model": "CustomPPO",
-    "reward_mode": "L2",
-    "timestamp": "2025-09-13T10:36:50.324686",
-    "step": 0,
-    "observation_image_path": "step_00000.png",
-    "action": [
-        1,
-        0,
-        0,
-        1,
-        1,
-        1,
-        0,
-        0,
-        1
-    ],
-    "reward": 0.0,
-    "terminated": false,
-    "truncated": false,
-    "info": {
-        "energy": 255,
-        "health": 5,
-        "score": 0
-    }
+  "game_name": "3NinjasKickBack-Genesis",
+  "game_type": "retro",
+  "model_type": "random",
+  "agent_type": "random",
+  "timestamp": "20251024_152924",
+  "step": 0,
+  "action": [
+    0,
+    1,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0
+  ],
+  "observation_image_path": "step_00000.png",
+  "reward": 0.0,
+  "info": {
+    "health": 6,
+    "lives": 3,
+    "progress": 0,
+    "score": 0
+  },
+  "terminated": false,
+  "truncated": false,
+  "total_reward_so_far": 0.0,
+  "agent_response": "[0 1 0 0 0 0 0 0 0 0 0 0]",
+  "agent_processing_time": 2.5272369384765625e-05,
+  "run_metadata": {
+    "total_reward": 0.0,
+    "actual_steps": 1,
+    "max_steps": 1000000,
+    "game_resets": 0,
+    "process_id": 1,
+    "run_id": 0,
+    "termination_reason": "unknown"
+  }
 }

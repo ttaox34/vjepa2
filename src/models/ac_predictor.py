@@ -43,17 +43,20 @@ class VisionTransformerPredictorAC(nn.Module):
         use_rope=True,
         action_embed_dim=7,
         use_extrinsics=False,
+        use_external_action_tokens=False,
         **kwargs
     ):
         super().__init__()
         self.is_frame_causal = is_frame_causal
         self.use_extrinsics = use_extrinsics
+        self.use_external_action_tokens = use_external_action_tokens
 
         # Map input to predictor dimension
         self.predictor_embed = nn.Linear(embed_dim, predictor_embed_dim, bias=True)
         self.action_encoder = nn.Linear(action_embed_dim, predictor_embed_dim, bias=True)
         self.state_encoder = nn.Linear(action_embed_dim, predictor_embed_dim, bias=True)
         self.extrinsics_encoder = nn.Linear(action_embed_dim - 1, predictor_embed_dim, bias=True)
+        self.predictor_embed_dim = predictor_embed_dim
 
         # Determine positional embedding
         if type(img_size) is int:
@@ -144,7 +147,15 @@ class VisionTransformerPredictorAC(nn.Module):
 
         # Interleave action tokens
         s = self.state_encoder(states).unsqueeze(2)
-        a = self.action_encoder(actions).unsqueeze(2)
+        if self.use_external_action_tokens:
+            if actions.size(-1) != self.predictor_embed_dim:
+                raise ValueError(
+                    f"External action tokens must have dimension {self.predictor_embed_dim}, "
+                    f"got {actions.size(-1)}"
+                )
+            a = actions.unsqueeze(2)
+        else:
+            a = self.action_encoder(actions).unsqueeze(2)
         x = x.view(B, T, self.grid_height * self.grid_width, D)  # [B, T, H*W, D]
         if self.use_extrinsics:
             e = self.extrinsics_encoder(extrinsics).unsqueeze(2)

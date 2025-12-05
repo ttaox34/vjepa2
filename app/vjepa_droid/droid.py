@@ -49,6 +49,14 @@ def init_data(
     frame_stride=None,
     manifest_paths=None,
     action_mappings=None,
+    include_returns=False,
+    include_action_latents=False,
+    action_latent_suffix=None,
+    require_action_latents=False,
+    return_raw_clips=False,
+    raw_clip_resize=None,
+    manifest_cache=False,
+    manifest_cache_dir=None,
 ):
     dataset_type = (dataset_type or "droid").lower()
     drop_last = drop_last if dataset_type != "retro" else False
@@ -65,6 +73,14 @@ def init_data(
             state_keys=state_keys,
             manifest_paths=manifest_paths,
             action_mappings=action_mappings,
+            include_returns=include_returns,
+            include_action_latents=include_action_latents,
+            action_latent_suffix=action_latent_suffix,
+            require_action_latents=require_action_latents,
+            return_raw_clips=return_raw_clips,
+            raw_resize=raw_clip_resize,
+            manifest_cache=manifest_cache,
+            manifest_cache_dir=manifest_cache_dir,
         )
     else:
         dataset = DROIDVideoDataset(

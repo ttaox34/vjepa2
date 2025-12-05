@@ -5,7 +5,9 @@
 # LICENSE file in the root directory of this source tree.
 #
 
+import contextlib
 import glob
+import hashlib
 import json
 import os
 import re
@@ -14,6 +16,8 @@ from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
+import torch
+import torch.nn.functional as F
 import torch.utils.data
 from PIL import Image
 
@@ -58,14 +62,81 @@ class ActionMapper:
             return []
         if isinstance(entry, int):
             return [entry]
+        if isinstance(entry, str):
+            entry = entry.strip()
+            if entry.isdigit():
+                return [int(entry)]
+            raise TypeError(f"Unsupported mapping entry string: '{entry}'")
         if isinstance(entry, list):
-            return [int(v) for v in entry if isinstance(v, (int, np.integer))]
+            normalized: List[int] = []
+            for value in entry:
+                if isinstance(value, (int, np.integer)):
+                    normalized.append(int(value))
+                elif isinstance(value, str):
+                    value = value.strip()
+                    if value.isdigit():
+                        normalized.append(int(value))
+                else:
+                    raise TypeError(f"Unsupported mapping entry list value: {type(value)}")
+            return normalized
         raise TypeError(f"Unsupported mapping entry type: {type(entry)}")
+
+    @classmethod
+    def _parse_semantic_router(
+        cls, data: Dict, path: Path
+    ) -> Tuple[List[List[int]], int, Optional[int], str]:
+        router = data.get("semantic_router")
+        if not isinstance(router, dict):
+            raise ValueError(f"'semantic_router' must be a dictionary in {path}")
+
+        semantics_by_idx: Dict[int, str] = {}
+        for key, value in data.items():
+            if key == "semantic_router":
+                continue
+            if isinstance(key, str) and key.isdigit():
+                semantics_by_idx[int(key)] = value
+
+        index_candidates = set(semantics_by_idx.keys())
+        for key in router.keys():
+            if isinstance(key, str) and key.isdigit():
+                index_candidates.add(int(key))
+
+        if not index_candidates:
+            raise ValueError(f"Unable to infer raw_dim from semantic router file {path}")
+
+        raw_dim = max(index_candidates) + 1
+        mapping_per_source: List[List[int]] = [[] for _ in range(raw_dim)]
+
+        for key, target in router.items():
+            normalized_target = cls._normalize_mapping_entry(target)
+
+            assigned_indices: List[int] = []
+            if isinstance(key, str) and key.isdigit():
+                assigned_indices = [int(key)]
+            else:
+                assigned_indices = [idx for idx, name in semantics_by_idx.items() if name == key]
+                if not assigned_indices:
+                    raise ValueError(
+                        f"Semantic key '{key}' in router does not match any action entries in {path}"
+                    )
+
+            for idx in assigned_indices:
+                if idx >= raw_dim:
+                    raise ValueError(
+                        f"Router index {idx} exceeds inferred raw_dim {raw_dim} in {path}"
+                    )
+                mapping_per_source[idx] = list(normalized_target)
+
+        reduction = data.get("reduction", "or")
+        file_global_dim = data.get("global_dim")
+        return mapping_per_source, raw_dim, file_global_dim, reduction
 
     @classmethod
     def from_file(cls, path: Path, global_dim: Optional[int]) -> "ActionMapper":
         data = json.loads(Path(path).read_text())
-        if isinstance(data, dict):
+        if isinstance(data, dict) and "semantic_router" in data:
+            mapping_per_source, raw_dim, file_global_dim, reduction = cls._parse_semantic_router(data, path)
+        elif isinstance(data, dict):
             mapping_entries = data.get("map_to") or data.get("mapping")
             if mapping_entries is None:
                 raise ValueError(f"Mapping file {path} must contain 'map_to' list")
@@ -120,6 +191,8 @@ class _Episode:
 class RetroGameDataset(torch.utils.data.Dataset):
     """Retro dataset supporting manifests and per-game action remapping."""
 
+    MANIFEST_CACHE_VERSION = 1
+
     def __init__(
         self,
         data_paths: Optional[Sequence[str]] = None,
@@ -132,6 +205,14 @@ class RetroGameDataset(torch.utils.data.Dataset):
         manifest_paths: Optional[Sequence[str]] = None,
         action_mappings: Optional[Sequence[Optional[str]]] = None,
         include_returns: bool = False,
+        include_action_latents: bool = False,
+        action_latent_suffix: Optional[str] = None,
+        require_action_latents: bool = False,
+        action_latent_dim: Optional[int] = None,
+        return_raw_clips: bool = False,
+        raw_resize: Optional[int] = None,
+        manifest_cache: bool = False,
+        manifest_cache_dir: Optional[str] = None,
     ):
         if frames_per_clip < 2:
             raise ValueError("frames_per_clip must be >= 2 for action-conditioned training.")
@@ -142,6 +223,14 @@ class RetroGameDataset(torch.utils.data.Dataset):
         self.default_state_value = default_state_value
         self.state_keys = list(state_keys) if state_keys is not None else None
         self.include_returns = include_returns
+        self.include_action_latents = include_action_latents
+        self.action_latent_suffix = action_latent_suffix
+        self.require_action_latents = require_action_latents
+        self.action_latent_dim = action_latent_dim
+        self.return_raw_clips = return_raw_clips
+        self.raw_resize = raw_resize
+        self.manifest_cache = manifest_cache
+        self.manifest_cache_dir = Path(manifest_cache_dir).expanduser() if manifest_cache_dir else None
 
         self.global_action_dim: Optional[int] = action_dim
         self.episodes: List[_Episode] = []
@@ -214,6 +303,7 @@ class RetroGameDataset(torch.utils.data.Dataset):
                 actions: List[np.ndarray] = []
                 rewards: List[float] = []
                 returns: List[float] = []
+                action_latents: List[np.ndarray] = []
 
                 for i, step_path in enumerate(step_files):
                     data = self._load_step(step_path, episode.mapper)
@@ -221,16 +311,21 @@ class RetroGameDataset(torch.utils.data.Dataset):
                     states.append(data["state"])
                     if i < len(step_files) - 1:
                         actions.append(data["action"])
+                        if self.include_action_latents:
+                            latent_vec = self._load_action_latent(step_path)
+                            action_latents.append(latent_vec)
                     rewards.append(data["reward"])
                     returns.append(data.get("discounted_return", 0.0))
 
-                def _stack(values: List[np.ndarray], target_len: int) -> np.ndarray:
+                def _stack(values: List[np.ndarray], target_len: int, width: Optional[int] = None) -> np.ndarray:
                     if values:
                         arr = np.stack(values, axis=0).astype(np.float32)
                     else:
-                        arr = np.zeros((0, self.global_action_dim), dtype=np.float32)
+                        size = self.global_action_dim if width is None else width
+                        arr = np.zeros((0, size), dtype=np.float32)
                     if arr.shape[0] < target_len:
-                        pad = np.zeros((target_len - arr.shape[0], self.global_action_dim), dtype=np.float32)
+                        size = arr.shape[1] if arr.ndim == 2 else (width or self.global_action_dim)
+                        pad = np.zeros((target_len - arr.shape[0], size), dtype=np.float32)
                         arr = np.concatenate([arr, pad], axis=0)
                     elif arr.shape[0] > target_len:
                         arr = arr[:target_len]
@@ -250,18 +345,53 @@ class RetroGameDataset(torch.utils.data.Dataset):
 
                 states_arr = _stack(states, self.frames_per_clip)
                 actions_arr = _stack(actions, self.frames_per_clip - 1 if self.frames_per_clip > 0 else 0)
+                latents_arr = None
+                if self.include_action_latents:
+                    if self.action_latent_dim is None:
+                        if action_latents:
+                            self.action_latent_dim = action_latents[0].shape[-1]
+                        else:
+                            raise ValueError(
+                                "action_latent_dim is undefined and no latent files were found. "
+                                "Provide action_latent_dim explicitly or ensure latent files exist."
+                            )
+                    latents_arr = _stack(
+                        action_latents,
+                        self.frames_per_clip - 1 if self.frames_per_clip > 0 else 0,
+                        width=self.action_latent_dim,
+                    )
                 rewards_arr = _stack_rewards(rewards, self.frames_per_clip)
                 returns_arr = _stack_rewards(returns, self.frames_per_clip)
                 extrinsics = np.zeros_like(states_arr, dtype=np.float32)
                 indices = np.arange(start_idx, start_idx + stride * self.frames_per_clip, stride, dtype=np.int64)
 
-                buffer = np.stack(images, axis=0)
+                buffer_uint8 = np.stack(images, axis=0)
+                raw_tensor = None
+                if self.return_raw_clips:
+                    raw_tensor = torch.from_numpy(buffer_uint8).permute(0, 3, 1, 2).float()
+                    if self.raw_resize is not None:
+                        raw_tensor = F.interpolate(
+                            raw_tensor,
+                            size=(self.raw_resize, self.raw_resize),
+                            mode="bilinear",
+                            align_corners=False,
+                        )
+                    raw_tensor = raw_tensor.contiguous()
+                buffer = buffer_uint8
                 if self.transform is not None:
                     buffer = self.transform(buffer)
+                else:
+                    buffer = torch.from_numpy(buffer).permute(3, 0, 1, 2).contiguous().float() / 255.0
 
+                sample = [buffer, actions_arr, states_arr, extrinsics, rewards_arr]
                 if self.include_returns:
-                    return buffer, actions_arr, states_arr, extrinsics, rewards_arr, returns_arr, indices
-                return buffer, actions_arr, states_arr, extrinsics, rewards_arr, indices
+                    sample.append(returns_arr)
+                if self.include_action_latents:
+                    sample.append(latents_arr)
+                if self.return_raw_clips:
+                    sample.append(raw_tensor if raw_tensor is not None else torch.zeros(0))
+                sample.append(indices)
+                return tuple(sample)
             except Exception:
                 index = np.random.randint(len(self))
                 if attempt == max_retries - 1:
@@ -309,6 +439,28 @@ class RetroGameDataset(torch.utils.data.Dataset):
                 self._add_episode(sub_steps, mapper)
 
     def _register_manifest(self, manifest_path: Path, mapper: Optional[ActionMapper]):
+        if not self.manifest_cache:
+            self._register_manifest_streaming(manifest_path, mapper)
+            return
+
+        records = self._load_manifest_records(manifest_path)
+        step_paths = records["paths"]
+        discounted = records["returns"]
+        offsets = records["offsets"]
+
+        for path, value in zip(step_paths, discounted):
+            self.discounted_returns[path] = value
+
+        start = 0
+        for end in offsets[1:]:
+            if end <= start:
+                continue
+            episode_files = step_paths[start:end]
+            if episode_files:
+                self._add_episode(list(episode_files), mapper)
+            start = end
+
+    def _register_manifest_streaming(self, manifest_path: Path, mapper: Optional[ActionMapper]):
         base = manifest_path.parent
         current: List[str] = []
         last_episode_id = None
@@ -346,6 +498,130 @@ class RetroGameDataset(torch.utils.data.Dataset):
 
         if current:
             self._add_episode(current, mapper)
+
+    def _load_manifest_records(self, manifest_path: Path) -> Dict[str, List]:
+        cached = self._maybe_load_manifest_cache(manifest_path)
+        if cached is not None:
+            return cached
+
+        base = manifest_path.parent
+        step_paths: List[str] = []
+        returns: List[float] = []
+        offsets: List[int] = [0]
+        last_episode_id = None
+        current_len = 0
+
+        with manifest_path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                record = json.loads(line)
+                if not record.get("keep", True):
+                    continue
+
+                json_path = record.get("json_path")
+                if json_path is None:
+                    continue
+                json_path = str(_resolve_path(base, json_path))
+
+                episode_id = record.get("episode_id")
+                terminated = bool(record.get("terminated", False))
+
+                if (
+                    current_len > 0
+                    and episode_id is not None
+                    and last_episode_id is not None
+                    and episode_id != last_episode_id
+                ):
+                    offsets.append(len(step_paths))
+                    current_len = 0
+
+                step_paths.append(json_path)
+                returns.append(float(record.get("discounted_return", 0.0)))
+                current_len += 1
+
+                if episode_id is not None:
+                    last_episode_id = episode_id
+
+                if terminated:
+                    offsets.append(len(step_paths))
+                    current_len = 0
+                    last_episode_id = None
+
+        if current_len > 0 and offsets[-1] != len(step_paths):
+            offsets.append(len(step_paths))
+        elif not step_paths:
+            offsets = [0, 0]
+        elif offsets[-1] != len(step_paths):
+            offsets.append(len(step_paths))
+
+        records = {"paths": step_paths, "returns": returns, "offsets": offsets}
+        self._write_manifest_cache(manifest_path, records)
+        return records
+
+    def _maybe_load_manifest_cache(self, manifest_path: Path) -> Optional[Dict[str, List]]:
+        if not self.manifest_cache:
+            return None
+        cache_path = self._manifest_cache_path(manifest_path)
+        if not cache_path.exists():
+            return None
+        try:
+            payload = torch.load(cache_path, map_location="cpu")
+        except Exception:
+            return None
+        try:
+            stat = manifest_path.stat()
+        except OSError:
+            return None
+        if (
+            payload.get("version") != self.MANIFEST_CACHE_VERSION
+            or payload.get("manifest_mtime") != stat.st_mtime
+            or payload.get("manifest_size") != stat.st_size
+        ):
+            return None
+        data = payload.get("data")
+        if not data:
+            return None
+        return data
+
+    def _write_manifest_cache(self, manifest_path: Path, data: Dict[str, List]):
+        if not self.manifest_cache:
+            return
+        cache_path = self._manifest_cache_path(manifest_path)
+        try:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            return
+        try:
+            stat = manifest_path.stat()
+            mtime = stat.st_mtime
+            size = stat.st_size
+        except OSError:
+            mtime = 0.0
+            size = 0
+        payload = {
+            "version": self.MANIFEST_CACHE_VERSION,
+            "manifest_mtime": mtime,
+            "manifest_size": size,
+            "data": data,
+        }
+        tmp_path = cache_path.with_suffix(cache_path.suffix + f".tmp{os.getpid()}")
+        try:
+            torch.save(payload, tmp_path)
+            os.replace(tmp_path, cache_path)
+        except Exception:
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(tmp_path)
+
+    def _manifest_cache_path(self, manifest_path: Path) -> Path:
+        if self.manifest_cache_dir is not None:
+            base_dir = self.manifest_cache_dir
+        else:
+            base_dir = manifest_path.parent / ".vjepa_cache"
+        digest = hashlib.sha1(str(manifest_path.resolve()).encode("utf-8")).hexdigest()[:16]
+        filename = f".{manifest_path.stem}.{digest}.cache.pt"
+        return base_dir / filename
 
     def _add_episode(self, step_files: List[str], mapper: Optional[ActionMapper]):
         max_start = len(step_files) - (self.frames_per_clip - 1) * self.frame_stride
@@ -423,3 +699,38 @@ class RetroGameDataset(torch.utils.data.Dataset):
             "reward": reward_val,
             "discounted_return": discounted_return,
         }
+
+    def _load_action_latent(self, json_path: str) -> np.ndarray:
+        if not self.include_action_latents:
+            raise RuntimeError("Dataset not configured to load action latents.")
+        suffix = self.action_latent_suffix or ".latent.pt"
+        latent_path = Path(json_path).with_suffix(suffix)
+        if not latent_path.exists():
+            if self.require_action_latents:
+                raise FileNotFoundError(f"Missing action latent file: {latent_path}")
+            if self.action_latent_dim is None:
+                raise ValueError(
+                    f"Cannot infer action latent dimension because {latent_path} is missing. "
+                    "Either provide at least one latent file or set action_latent_dim explicitly."
+                )
+            return np.zeros((self.action_latent_dim,), dtype=np.float32)
+
+        if latent_path.suffix in {".pt", ".pth"}:
+            latent = torch.load(latent_path, map_location="cpu")
+            if isinstance(latent, torch.Tensor):
+                latent_np = latent.detach().cpu().numpy()
+            else:
+                latent_np = np.array(latent)
+        elif latent_path.suffix == ".npy":
+            latent_np = np.load(latent_path)
+        else:
+            raise ValueError(f"Unsupported action latent file extension: {latent_path.suffix}")
+
+        latent_np = np.asarray(latent_np, dtype=np.float32).reshape(-1)
+        if self.action_latent_dim is None:
+            self.action_latent_dim = latent_np.size
+        elif latent_np.size != self.action_latent_dim:
+            raise ValueError(
+                f"Inconsistent latent size for {latent_path}: expected {self.action_latent_dim}, got {latent_np.size}"
+            )
+        return latent_np

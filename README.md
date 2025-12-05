@@ -373,6 +373,16 @@ python -m app.main_distributed \
   --account my_account --qos=my_qos
 ```
 
+To mirror training statistics into TensorBoard, add the following to the `meta` section of any training config:
+
+```yaml
+meta:
+  use_tensorboard: true
+  tensorboard_logdir: /optional/custom/path  # defaults to <folder>/tensorboard
+```
+
+Rank 0 will record per-iteration loss, LR, weight decay, timing, and mask ratios. Launch `tensorboard --logdir <logdir>` to monitor runs in real time.
+
 ### Postraining
 
 Post-training of the action-conditioned model, starting from the pretrained VJEPA 2 backbone, also follows a similar interface, and can be run locally or distributed using [this config](configs/train/vitg16/droid-256px-8f.yaml).

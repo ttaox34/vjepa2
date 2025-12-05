@@ -6,6 +6,7 @@ This repository now supports training V-JEPA 2 and V-JEPA 2-AC models on retro g
 - `app/vjepa_droid/game_dataset.py`: New dataset class that scans one or more folders (or glob patterns) containing `step_*.json`/`step_*.png` files, constructs sliding windows, and pads or trims actions/states so every clip has consistent shapes. It also supports per-game action remapping via JSON mapping files so multiple games can share a common "mega" action vector.
 - `app/vjepa_droid/droid.py`: `init_data` now switches between the DROID loader and the new retro dataset. It logs clip counts, validates that trajectories exist, and honours parameters such as `frame_stride`, `state_keys`, and `action_dim`.
 - `tools/retro_preprocess.py`: Optional offline cleaner that scans raw retro dumps, detects dark screens (while keeping legitimate "no-action" pauses), and emits a manifest describing which frames to keep and where each episode terminates. Training consumes the manifest instead of touching the raw PNG/JSON files.
+- `app/vjepa/retro_dataset.py`: Adapter that reuses `RetroGameDataset` inside the vanilla V-JEPA pipeline by exposing samples in the `(clips, label, clip_indices)` format consumed by the multiseq mask collator. Setting `data.dataset_type: retro` in any V-JEPA config now routes through this adapter.
 - `tools/plot_metric_boxplot.py`: Utility that reads the per-frame metric CSVs produced by evaluation scripts and draws comparative box (or violin) plots (useful when benchmarking multiple checkpoints or games).
 - `tools/train_reward_head.py`: Freezes the trained encoder/predictor, extracts latent features for each transition, and fits a small MLP to predict per-step rewards (using the rewards stored in the JSON trajectories). The resulting head can be reused as a lightweight reward model for downstream agents.
 - `configs/train/vitl16/game-retro-256px-8f.yaml`: Example configuration for training a ViT-L AC model on retro data. It shows how to point at multiple directories, set action/state dimensions, and reuse pretrained checkpoints.
@@ -22,7 +23,7 @@ This repository now supports training V-JEPA 2 and V-JEPA 2-AC models on retro g
 ## Monitoring
 - Additional logging highlights dataset initialization and warns if action/state widths are inconsistent, helping trace any future schema issues.
 
-Use `python -m app.main --fname configs/train/vitl16/game-retro-256px-8f.yaml --devices cuda:0 --debugmode True` for single-GPU debugging, then drop `--debugmode` to scale out. Ensure `data.datasets` lists every retro folder (or glob) you want included. When manifests and action mappings are available, add them alongside the raw directories:
+Use `python -m app.main --fname configs/train/vitl16/game-retro-256px-8f.yaml --devices cuda:0 --debugmode True` for action-conditioned training or `configs/train/vitl16/retro-pretrain-256px-16f.yaml` for the pure ViT-L/16 JEPA encoder. Ensure `data.datasets` lists every retro folder (or glob) you want included. When manifests and action mappings are available, add them alongside the raw directories:
 
 ```
 data:
@@ -90,6 +91,42 @@ torchrun --nnodes=1 --nproc_per_node=4 tools/train_reward_head.py \
 ```
 
 When training on many games, consider using a dataset config (see `configs/reward/multi_game_example.yaml`) and pass it via `--data-config`. Each entry lists raw data folders plus matching manifest/action mapping files, allowing the script to construct a unified dataset automatically. Checkpoints (including `latest.pt`) are written to `--logdir/checkpoints`; pass `--resume` to continue from the most recent epoch.
+
+### Training a Value Head from Encoder Latents
+
+If you just need a value predictor that consumes encoder outputs (without running the AC predictor), use `tools/train_value_head_from_encoder.py`. It freezes the ViT encoder, extracts the target-frame patch tokens, concatenates every patch latent into a single vector per frame, and trains a small MLP to regress discounted returns:
+
+```
+python tools/train_value_head_from_encoder.py \
+  --fname configs/train/vitl16/retro-pretrain-256px-16f.yaml \
+  --checkpoint /path/to/vitl.pt \
+  --datasets /path/to/retro/data \
+  --manifest /path/to/retro/manifest.jsonl \
+  --action-mappings /path/to/retro/action_map.json \
+  --frames-per-clip 2 --batch-size 24 --epochs 5 \
+  --logdir runs/value_head_encoder
+```
+
+By default it concatenates every patch latent per frame before passing them to the MLP; switch to `--pooling mean` if you prefer the (lighter) mean-pooled variant used by the older reward head. The trained head can consume encoder targets or AC predictor latents (same feature space). Set `--target reward` to learn immediate rewards instead of discounted values, and `--recompute-returns` to rebuild returns from raw rewards when the dataset lacks discounted targets.
+
+### Training an Action-conditioned Q Head
+
+To score candidate actions (e.g., proposed by a VLM agent), use `tools/train_q_head_from_encoder.py`. The script freezes the encoder, projects each action vector, adds it to every patch token of the corresponding frame, pools the conditioned tokens (mean or concatenation), and regresses the manifest-provided discounted returns:
+
+```
+python tools/train_q_head_from_encoder.py \
+  --fname configs/train/vitl16/retro-pretrain-256px-16f.yaml \
+  --checkpoint /path/to/vitl.pt \
+  --datasets /path/to/retro/data \
+  --manifest /path/to/retro/manifest.jsonl \
+  --action-mappings /path/to/retro/action_map.json \
+  --frames-per-clip 2 --batch-size 24 --epochs 5 \
+  --pooling mean --logdir runs/q_head_encoder
+```
+
+Switch to `--pooling concat` to keep the entire patch grid (higher dimensional, potentially more expressive). The trained Q head takes a `(state_latent, action_vector)` pair and outputs `Q(s, a)` so you can pick the highest-valued action among VLM suggestions. Use `--recompute-returns` when you want to rebuild discounted returns with a different `--discount`.
+
+For quick experiments, `tools/q_head_demo.py` spins up a Gradio UI: upload a frame (or drop in a file) and list candidate action vectors (one per line), and the page will display each action's Q-value so you can sanity-check rankings before wiring the head into your VLM control loop.
 
 ### Action Mapping File Format
 

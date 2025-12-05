@@ -29,6 +29,8 @@ import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel
 
 from app.vjepa_droid.droid import init_data
+from app.vjepa_droid.lam_action_encoder import build_lam_encoder
+from app.vjepa_droid.sample_utils import unpack_sample
 from app.vjepa_droid.transforms import make_transforms
 from app.vjepa_droid.utils import init_opt, init_video_model, load_checkpoint, load_pretrained
 from src.utils.distributed import init_distributed
@@ -97,6 +99,7 @@ def main(args, resume_preempt=False):
     use_pred_silu = cfgs_model.get("use_pred_silu", False)
     wide_silu = cfgs_model.get("wide_silu", True)
     use_extrinsics = cfgs_model.get("use_extrinsics", False)
+    use_external_action_tokens = cfgs_model.get("use_external_action_tokens", False)
 
     # -- DATA
     cfgs_data = args.get("data")
@@ -122,9 +125,18 @@ def main(args, resume_preempt=False):
     state_keys = cfgs_data.get("state_keys")
     action_mappings = cfgs_data.get("action_mappings")
     manifest_paths = cfgs_data.get("manifest_paths")
+    manifest_cache = cfgs_data.get("manifest_cache", False)
+    manifest_cache_dir = cfgs_data.get("manifest_cache_dir")
     pin_mem = cfgs_data.get("pin_mem", False)
     num_workers = cfgs_data.get("num_workers", 1)
     persistent_workers = cfgs_data.get("persistent_workers", True)
+    use_action_latents = cfgs_data.get("use_action_latents", False)
+    if use_external_action_tokens and use_action_latents:
+        logger.warning("Both use_external_action_tokens and use_action_latents are set; disabling file-based latents.")
+        use_action_latents = False
+    action_latent_suffix = cfgs_data.get("action_latent_suffix", ".latent.pt")
+    require_action_latents = cfgs_data.get("require_action_latents", False)
+    return_raw_clips = cfgs_data.get("return_raw_clips", False) or use_external_action_tokens
 
     # -- DATA AUGS
     cfgs_data_aug = args.get("data_aug")
@@ -212,6 +224,10 @@ def main(args, resume_preempt=False):
     )
 
     # -- init data-loaders/samplers
+    dataset_action_dim_override = None if use_external_action_tokens else cfgs_model.get("action_embed_dim")
+    if dataset_action_dim_override is None:
+        dataset_action_dim_override = cfgs_data.get("action_dim")
+
     dataset, unsupervised_loader, unsupervised_sampler = init_data(
         data_path=dataset_path,
         retro_paths=datasets if dataset_type == "retro" else None,
@@ -230,11 +246,18 @@ def main(args, resume_preempt=False):
         persistent_workers=persistent_workers,
         rank=rank,
         dataset_type=dataset_type,
-        action_dim=cfgs_model.get("action_embed_dim"),
+        action_dim=dataset_action_dim_override,
         state_keys=state_keys,
         frame_stride=frame_stride,
         manifest_paths=manifest_paths,
         action_mappings=action_mappings,
+        include_action_latents=use_action_latents,
+        action_latent_suffix=action_latent_suffix if use_action_latents else None,
+        require_action_latents=require_action_latents,
+        return_raw_clips=return_raw_clips,
+        raw_clip_resize=crop_size if return_raw_clips else None,
+        manifest_cache=manifest_cache,
+        manifest_cache_dir=manifest_cache_dir,
     )
 
     dataset_action_dim = getattr(dataset, "action_dim", None)
@@ -244,14 +267,18 @@ def main(args, resume_preempt=False):
             logger.info(f"Inferred state keys from dataset: {detected_state_keys}")
     action_embed_dim = cfgs_model.get("action_embed_dim")
     if action_embed_dim is None:
+        if use_external_action_tokens:
+            raise ValueError("model.use_external_action_tokens=True requires action_embed_dim to be set explicitly.")
         action_embed_dim = dataset_action_dim or 7
         if rank == 0:
             logger.info(f"Inferred action embedding dim from dataset: {action_embed_dim}")
-    elif dataset_action_dim is not None and action_embed_dim != dataset_action_dim and rank == 0:
+    elif not use_external_action_tokens and dataset_action_dim is not None and action_embed_dim != dataset_action_dim and rank == 0:
         logger.warning(
             f"Configured action_embed_dim ({action_embed_dim}) differs from dataset action_dim ({dataset_action_dim}); "
             "sequences will be padded or truncated accordingly."
         )
+    if use_action_latents and not getattr(dataset, "include_action_latents", False):
+        raise ValueError("data.use_action_latents=True but dataset was not configured to return latents.")
 
     # -- init model
     model_num_frames = max_num_frames * max(1, tubelet_size)
@@ -275,8 +302,12 @@ def main(args, resume_preempt=False):
         wide_silu=wide_silu,
         use_rope=use_rope,
         use_activation_checkpointing=use_activation_checkpointing,
+        use_external_action_tokens=use_external_action_tokens,
     )
     target_encoder = copy.deepcopy(encoder)
+    lam_encoder = None
+    if use_external_action_tokens:
+        lam_encoder = build_lam_encoder(cfgs_model, device)
 
     if compile_model:
         logger.info("Compiling encoder, target_encoder, and predictor.")
@@ -389,6 +420,10 @@ def main(args, resume_preempt=False):
         gc.collect()
 
     # -- TRAINING LOOP
+    include_returns_flag = getattr(dataset, "include_returns", False)
+    include_latent_flag = getattr(dataset, "include_action_latents", False)
+    include_raw_flag = getattr(dataset, "return_raw_clips", False)
+
     for epoch in range(start_epoch, num_epochs):
         logger.info("Epoch %d" % (epoch + 1))
 
@@ -423,14 +458,48 @@ def main(args, resume_preempt=False):
                         raise e
 
             def load_clips():
-                clips = sample[0].to(device, non_blocking=True)  # [B C T H W]
-                actions = sample[1].to(device, dtype=torch.float, non_blocking=True)  # [B T-1 7]
-                states = sample[2].to(device, dtype=torch.float, non_blocking=True)  # [B T 7]
-                extrinsics = sample[3].to(device, dtype=torch.float, non_blocking=True)  # [B T 7]
-                rewards = sample[4].to(device, dtype=torch.float, non_blocking=True)  # [B T]
-                return (clips, actions, states, extrinsics, rewards)
+                (
+                    clips,
+                    actions,
+                    states,
+                    extrinsics,
+                    rewards,
+                    returns,
+                    action_latents,
+                    raw_clips,
+                    _,
+                ) = unpack_sample(
+                    sample,
+                    include_returns=include_returns_flag,
+                    include_action_latents=include_latent_flag,
+                    include_raw_clips=include_raw_flag,
+                )
+                clips = clips.to(device, non_blocking=True)
+                actions = actions.to(device, dtype=torch.float32, non_blocking=True)
+                states = states.to(device, dtype=torch.float32, non_blocking=True)
+                extrinsics = extrinsics.to(device, dtype=torch.float32, non_blocking=True)
+                rewards = rewards.to(device, dtype=torch.float32, non_blocking=True)
+                if returns is not None:
+                    returns = returns.to(device, dtype=torch.float32, non_blocking=True)
+                if action_latents is not None:
+                    action_latents = action_latents.to(device, dtype=torch.float32, non_blocking=True)
+                if raw_clips is not None:
+                    raw_clips = raw_clips.to(device, non_blocking=True)
+                return clips, actions, states, extrinsics, rewards, returns, action_latents, raw_clips
 
-            clips, actions, states, extrinsics, _ = load_clips()
+            clips, raw_actions, states, extrinsics, _, _, action_latents, raw_clips = load_clips()
+            if use_external_action_tokens:
+                if raw_clips is None:
+                    raise RuntimeError("External action tokens enabled but dataset did not return raw clips.")
+                actions = lam_encoder.encode(raw_clips)
+                if actions.size(-1) != pred_embed_dim:
+                    raise RuntimeError(
+                        f"LAM action latent dim mismatch: expected {pred_embed_dim}, got {actions.size(-1)}"
+                    )
+            elif action_latents is not None:
+                actions = action_latents
+            else:
+                actions = raw_actions
             data_elapsed_time_ms = (time.time() - itr_start_time) * 1000.0
 
             if sync_gc and (itr + 1) % GARBAGE_COLLECT_ITR_FREQ == 0:
@@ -487,6 +556,7 @@ def main(args, resume_preempt=False):
                                 device=tensor.device,
                                 dtype=tensor.dtype,
                             )
+                            # if torch.any(torch.abs(tensor) > 0):
                             logger.warning(
                                 f"{name} width mismatch detected (found {tensor.size(-1)}, expected {width}); padding."
                             )

@@ -146,6 +146,7 @@ def init_video_model(
     action_embed_dim=7,
     use_extrinsics=False,
     old_pred=False,
+    use_external_action_tokens=False,
 ):
     encoder = video_vit.__dict__[model_name](
         img_size=crop_size,
@@ -178,6 +179,7 @@ def init_video_model(
         wide_silu=wide_silu,
         use_extrinsics=use_extrinsics,
         use_activation_checkpointing=use_activation_checkpointing,
+        use_external_action_tokens=use_external_action_tokens,
     )
 
     encoder.to(device)

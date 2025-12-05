@@ -25,7 +25,9 @@ import torch
 import torch.multiprocessing as mp
 import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel
+from torch.utils.tensorboard import SummaryWriter
 
+from app.vjepa.retro_dataset import init_retro_data
 from app.vjepa.transforms import make_transforms
 from app.vjepa.utils import init_opt, init_video_model, load_checkpoint
 from src.datasets.data_manager import init_data
@@ -67,6 +69,9 @@ def main(args, resume_preempt=False):
     use_sdpa = cfgs_meta.get("use_sdpa", False)
     sync_gc = cfgs_meta.get("sync_gc", False)
     which_dtype = cfgs_meta.get("dtype")
+    load_optimizer_state = cfgs_meta.get("load_optimizer", True)
+    use_tensorboard = cfgs_meta.get("use_tensorboard", False)
+    tensorboard_logdir = cfgs_meta.get("tensorboard_logdir")
     logger.info(f"{which_dtype=}")
     if which_dtype.lower() == "bfloat16":
         dtype = torch.bfloat16
@@ -111,9 +116,24 @@ def main(args, resume_preempt=False):
     fps = cfgs_data.get("fps")
     crop_size = cfgs_data.get("crop_size", 224)
     patch_size = cfgs_data.get("patch_size")
+    frame_stride = cfgs_data.get("frame_stride", 1)
+    state_keys = cfgs_data.get("state_keys")
+    action_mappings = cfgs_data.get("action_mappings")
+    manifest_paths = cfgs_data.get("manifest_paths")
+    manifest_cache = cfgs_data.get("manifest_cache", False)
+    manifest_cache_dir = cfgs_data.get("manifest_cache_dir")
+    action_dim = cfgs_data.get("action_dim")
+    if action_dim is None:
+        action_dim = cfgs_model.get("action_embed_dim")
     pin_mem = cfgs_data.get("pin_mem", False)
     num_workers = cfgs_data.get("num_workers", 1)
     persistent_workers = cfgs_data.get("persistent_workers", True)
+    retro_frames_per_clip = None
+    if dataset_type.lower() == "retro":
+        unique_fpcs = sorted(set(dataset_fpcs))
+        if len(unique_fpcs) != 1:
+            raise ValueError(f"Retro dataset requires a single frames_per_clip value, got {dataset_fpcs}")
+        retro_frames_per_clip = unique_fpcs[0]
 
     # -- DATA AUGS
     cfgs_data_aug = args.get("data_aug")
@@ -164,8 +184,10 @@ def main(args, resume_preempt=False):
     # -- set device
     if not torch.cuda.is_available():
         device = torch.device("cpu")
+        local_rank = 0
     else:
-        device = torch.device("cuda:0")
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        device = torch.device(f"cuda:{local_rank}")
         torch.cuda.set_device(device)
 
     # -- log/checkpointing paths
@@ -196,6 +218,8 @@ def main(args, resume_preempt=False):
         ("%d", "gpu-time(ms)"),
         ("%d", "dataload-time(ms)"),
     )
+
+    writer = None
 
     # -- init model
     encoder, predictor = init_video_model(
@@ -245,24 +269,50 @@ def main(args, resume_preempt=False):
         crop_size=crop_size,
     )
 
+    if use_tensorboard and rank == 0:
+        tb_dir = tensorboard_logdir or os.path.join(folder, "tensorboard")
+        writer = SummaryWriter(log_dir=tb_dir)
+
     # -- init data-loaders/samplers
-    (unsupervised_loader, unsupervised_sampler) = init_data(
-        data=dataset_type,
-        root_path=dataset_paths,
-        batch_size=batch_size,
-        training=True,
-        dataset_fpcs=dataset_fpcs,
-        fps=fps,
-        transform=transform,
-        rank=rank,
-        world_size=world_size,
-        datasets_weights=datasets_weights,
-        persistent_workers=persistent_workers,
-        collator=mask_collator,
-        num_workers=num_workers,
-        pin_mem=pin_mem,
-        log_dir=None,
-    )
+    if dataset_type.lower() == "retro":
+        (unsupervised_loader, unsupervised_sampler) = init_retro_data(
+            data_paths=dataset_paths,
+            batch_size=batch_size,
+            frames_per_clip=retro_frames_per_clip,
+            frame_stride=frame_stride or 1,
+            transform=transform,
+            collator=mask_collator,
+            manifest_paths=manifest_paths,
+            action_mappings=action_mappings,
+            action_dim=action_dim,
+            state_keys=state_keys,
+            num_workers=num_workers,
+            pin_mem=pin_mem,
+            persistent_workers=persistent_workers,
+            world_size=world_size,
+            rank=rank,
+            drop_last=True,
+            manifest_cache=manifest_cache,
+            manifest_cache_dir=manifest_cache_dir,
+        )
+    else:
+        (unsupervised_loader, unsupervised_sampler) = init_data(
+            data=dataset_type,
+            root_path=dataset_paths,
+            batch_size=batch_size,
+            training=True,
+            dataset_fpcs=dataset_fpcs,
+            fps=fps,
+            transform=transform,
+            rank=rank,
+            world_size=world_size,
+            datasets_weights=datasets_weights,
+            persistent_workers=persistent_workers,
+            collator=mask_collator,
+            num_workers=num_workers,
+            pin_mem=pin_mem,
+            log_dir=None,
+        )
     try:
         _dlen = len(unsupervised_loader)
     except Exception:  # Different interface for webdataset
@@ -319,6 +369,7 @@ def main(args, resume_preempt=False):
             opt=optimizer,
             scaler=scaler,
             is_anneal=is_anneal and not resume_anneal,
+            load_opt_state=load_optimizer_state,
         )
         if not is_anneal or resume_anneal:
             for _ in range(start_epoch * ipe):
@@ -523,10 +574,23 @@ def main(args, resume_preempt=False):
                     )
 
             log_stats()
+            if writer is not None:
+                global_step = epoch * ipe + itr
+                writer.add_scalar("train/loss", loss, global_step)
+                writer.add_scalar("train/loss_avg", loss_meter.avg, global_step)
+                writer.add_scalar("train/lr", _new_lr, global_step)
+                writer.add_scalar("train/wd", _new_wd, global_step)
+                writer.add_scalar("train/iter_time_ms", iter_elapsed_time_ms, global_step)
+                writer.add_scalar("train/gpu_time_ms", gpu_etime_ms, global_step)
+                writer.add_scalar("train/data_time_ms", data_elapsed_time_ms, global_step)
+                for fpc, meter in mask_meters.items():
+                    writer.add_scalar(f"mask/fpc_{fpc}", meter.avg, global_step)
             assert not np.isnan(loss), "loss is nan"
 
         # -- Save Checkpoint
         logger.info("avg. loss %.3f" % loss_meter.avg)
+        if writer is not None:
+            writer.add_scalar("epoch/loss", loss_meter.avg, epoch + 1)
         # -- Save Last
         if epoch % CHECKPOINT_FREQ == 0 or epoch == (num_epochs - 1):
             save_checkpoint(epoch + 1, latest_path)
@@ -534,3 +598,6 @@ def main(args, resume_preempt=False):
                 save_every_file = f"e{epoch}.pt"
                 save_every_path = os.path.join(folder, save_every_file)
                 save_checkpoint(epoch + 1, save_every_path)
+
+    if writer is not None:
+        writer.close()

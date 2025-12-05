@@ -12,6 +12,8 @@ from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
 
 from app.vjepa_droid.game_dataset import RetroGameDataset
+from app.vjepa_droid.lam_action_encoder import build_lam_encoder
+from app.vjepa_droid.sample_utils import unpack_sample
 from app.vjepa_droid.utils import init_video_model
 from tools.eval_retro_predictor import (
     build_dataset,
@@ -19,6 +21,7 @@ from tools.eval_retro_predictor import (
     load_models,
     make_eval_transform,
     predictor_step,
+    unpack_sample,
 )
 
 
@@ -60,6 +63,8 @@ def parse_args():
     parser.add_argument("--use-target", action="store_true", help="Train on target latents instead of predicted latents.")
     parser.add_argument("--logdir", type=str, default="runs/reward_head", help="Directory for logs and checkpoints.")
     parser.add_argument("--resume", action="store_true", help="Resume training from the latest checkpoint in logdir.")
+    parser.add_argument("--use-action-latents", action="store_true", help="Load precomputed action latent vectors.")
+    parser.add_argument("--action-latent-suffix", type=str, default=".latent.pt", help="File suffix for action latent tensors.")
     return parser.parse_args()
 
 
@@ -133,6 +138,12 @@ def main():
         if not entry["datasets"]:
             raise ValueError("Dataset entry missing 'paths'.")
 
+    model_requires_latents = cfg["model"].get("use_external_action_tokens", False)
+    if model_requires_latents and not args.use_action_latents:
+        raise ValueError("Model expects external action tokens but --use-action-latents was not set.")
+    if args.use_action_latents and not model_requires_latents:
+        print("Warning: using action latents even though model.use_external_action_tokens is False.")
+
     datasets_list = []
     for entry in dataset_entries:
         ds = build_dataset(
@@ -143,6 +154,10 @@ def main():
             manifest_paths=entry["manifest"] or None,
             action_mappings=entry["action_mappings"] or None,
             include_returns=True,
+            include_action_latents=args.use_action_latents,
+            action_latent_suffix=args.action_latent_suffix if args.use_action_latents else None,
+            return_raw_clips=model_requires_latents,
+            raw_resize=cfg["data"]["crop_size"] if model_requires_latents else None,
         )
         datasets_list.append(ds)
 
@@ -194,6 +209,9 @@ def main():
         device,
         args.checkpoint,
     )
+    lam_encoder = None
+    if model_requires_latents:
+        lam_encoder = build_lam_encoder(cfg["model"], device)
     encoder.eval()
     predictor.eval()
     for p in encoder.parameters():
@@ -276,12 +294,38 @@ def main():
         epoch_loss = 0.0
         count = 0
         for batch in loader:
-            clips = batch[0].to(device)
-            actions = batch[1].to(device, dtype=torch.float32)
-            states = batch[2].to(device, dtype=torch.float32)
-            extrinsics = batch[3].to(device, dtype=torch.float32)
-            rewards = batch[4].to(device, dtype=torch.float32)
-            returns = batch[5].to(device, dtype=torch.float32)
+            (
+                clips,
+                raw_actions,
+                states,
+                extrinsics,
+                rewards,
+                returns,
+                action_latents,
+                raw_clips,
+                _,
+            ) = unpack_sample(
+                batch,
+                include_returns=True,
+                include_action_latents=args.use_action_latents,
+                include_raw_clips=model_requires_latents,
+            )
+            clips = clips.to(device)
+            raw_actions = raw_actions.to(device, dtype=torch.float32)
+            states = states.to(device, dtype=torch.float32)
+            extrinsics = extrinsics.to(device, dtype=torch.float32)
+            rewards = rewards.to(device, dtype=torch.float32)
+            returns = returns.to(device, dtype=torch.float32)
+            if model_requires_latents:
+                if raw_clips is None:
+                    raise RuntimeError("Reward head training requires raw clips for LAM inference.")
+                actions = lam_encoder.encode(raw_clips.to(device, non_blocking=True))
+            elif args.use_action_latents:
+                if action_latents is None:
+                    raise RuntimeError("Dataset did not return action latents.")
+                actions = action_latents.to(device, dtype=torch.float32)
+            else:
+                actions = raw_actions
 
             features = compute_features(clips, actions, states, extrinsics)
             # reshape features to [B, T, tokens_per_frame, embed_dim]

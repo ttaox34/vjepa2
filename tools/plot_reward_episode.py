@@ -29,6 +29,13 @@ def parse_args():
     parser.add_argument("--mode", choices=["reward", "value"], default="reward", help="Head training mode (reward/value).")
     parser.add_argument("--discount", type=float, default=0.99, help="Discount factor if mode=value.")
     parser.add_argument("--device", default=None, help="Device override (e.g. cuda:0).")
+    parser.add_argument("--use-action-latents", action="store_true", help="Load external action latent vectors.")
+    parser.add_argument(
+        "--action-latent-suffix",
+        type=str,
+        default=".latent.pt",
+        help="File suffix for per-frame action latent tensors.",
+    )
     return parser.parse_args()
 
 
@@ -100,15 +107,35 @@ def map_action(vec: np.ndarray, mapper: Optional[ActionMapper], action_dim: int)
     return out
 
 
+def load_action_latent_file(json_path: Path, suffix: str) -> np.ndarray:
+    latent_path = json_path.with_suffix(suffix)
+    if not latent_path.exists():
+        raise FileNotFoundError(f"Missing action latent file: {latent_path}")
+    if latent_path.suffix in {".pt", ".pth"}:
+        latent = torch.load(latent_path, map_location="cpu")
+        if isinstance(latent, torch.Tensor):
+            latent_np = latent.detach().cpu().numpy()
+        else:
+            latent_np = np.array(latent)
+    elif latent_path.suffix == ".npy":
+        latent_np = np.load(latent_path)
+    else:
+        raise ValueError(f"Unsupported action latent file extension: {latent_path.suffix}")
+    return np.asarray(latent_np, dtype=np.float32).reshape(-1)
+
+
 def prepare_episode(
     episode_entries: Sequence[dict],
     action_mapper: Optional[ActionMapper],
     action_dim: int,
-) -> Tuple[List[np.ndarray], List[np.ndarray], List[float], List[float]]:
+    use_action_latents: bool,
+    action_latent_suffix: str,
+) -> Tuple[List[np.ndarray], List[np.ndarray], List[float], List[float], List[np.ndarray]]:
     frames: List[np.ndarray] = []
     actions: List[np.ndarray] = []
     rewards: List[float] = []
     returns: List[float] = []
+    latents: List[np.ndarray] = []
 
     for idx, entry in enumerate(episode_entries):
         json_path = Path(entry["json_path"])
@@ -118,7 +145,9 @@ def prepare_episode(
         returns.append(float(entry.get("discounted_return", 0.0)))
         if idx < len(episode_entries) - 1:
             actions.append(map_action(raw_action, action_mapper, action_dim))
-    return frames, actions, rewards, returns
+            if use_action_latents:
+                latents.append(load_action_latent_file(json_path, action_latent_suffix))
+    return frames, actions, rewards, returns, latents
 
 
 def compute_predictions(
@@ -126,6 +155,7 @@ def compute_predictions(
     actions: Sequence[np.ndarray],
     rewards: Sequence[float],
     returns: Sequence[float],
+    action_latents: Sequence[np.ndarray],
     encoder,
     predictor,
     reward_head,
@@ -136,6 +166,7 @@ def compute_predictions(
     tokens_per_frame: int,
     normalize_reps: bool,
     use_target: bool,
+    use_action_latents: bool,
     mode: str,
     discount: float,
     frames_per_clip: int,
@@ -144,6 +175,8 @@ def compute_predictions(
     targets: List[float] = []
     actions_arr = np.asarray(actions, dtype=np.float32)
     action_dim = actions_arr.shape[1] if actions_arr.size > 0 else 0
+    latent_arr = np.asarray(action_latents, dtype=np.float32) if action_latents else np.zeros((0,), dtype=np.float32)
+    latent_dim = latent_arr.shape[1] if latent_arr.ndim == 2 else (latent_arr.size if latent_arr.ndim == 1 else 0)
     rewards_arr = np.asarray(rewards, dtype=np.float32)
     returns_arr = np.asarray(returns, dtype=np.float32)
 
@@ -156,10 +189,17 @@ def compute_predictions(
         clip_tensor = transform(clip_np).unsqueeze(0).to(device)
 
         act_steps = frames_per_clip - 1
-        act_tensor = torch.zeros((1, act_steps, action_dim), dtype=torch.float32, device=device)
-        if action_dim > 0 and actions_arr.size:
+        if use_action_latents:
+            if latent_arr.size == 0:
+                raise ValueError("Action latents required but not provided.")
+            act_tensor = torch.zeros((1, act_steps, latent_dim), dtype=torch.float32, device=device)
             for idx in range(act_steps):
-                act_tensor[0, idx] = torch.as_tensor(actions_arr[start + idx], device=device)
+                act_tensor[0, idx] = torch.as_tensor(latent_arr[start + idx], device=device)
+        else:
+            act_tensor = torch.zeros((1, act_steps, action_dim), dtype=torch.float32, device=device)
+            if action_dim > 0 and actions_arr.size:
+                for idx in range(act_steps):
+                    act_tensor[0, idx] = torch.as_tensor(actions_arr[start + idx], device=device)
         state_tensor = torch.zeros_like(act_tensor)
         extrinsics_tensor = torch.zeros_like(act_tensor)
 
@@ -179,21 +219,30 @@ def compute_predictions(
                 dim=tokens_per_frame,
             )
             features = z_target if use_target else z_pred
-            features = features.view(1, -1, tokens_per_frame, features.size(-1)).mean(dim=2)
-            pred = reward_head(features.reshape(-1, features.size(-1)))
-            preds.append(float(pred.item()))
+            features = features.view(1, -1, tokens_per_frame, features.size(-1)).mean(dim=2)  # [1, T, D]
+            T = features.size(1)
+            pred = reward_head(features.reshape(-1, features.size(-1))).view(1, T)
 
-        target_idx = start + frames_per_clip - 1
         if mode == "reward":
-            targets.append(float(rewards_arr[target_idx]))
+            target_seq = torch.as_tensor(
+                rewards_arr[start + 1 : start + 1 + T], dtype=torch.float32
+            ).view(1, T)
         else:
             if returns_arr.size:
-                targets.append(float(returns_arr[target_idx]))
+                target_seq = torch.as_tensor(
+                    returns_arr[start + 1 : start + 1 + T], dtype=torch.float32
+                ).view(1, T)
             else:
-                future = 0.0
-                for t in range(target_idx, len(rewards_arr)):
-                    future = rewards_arr[t] + discount * future
-                targets.append(float(future))
+                future_vals = []
+                for offset in range(T):
+                    future = 0.0
+                    for t in range(start + 1 + offset, len(rewards_arr)):
+                        future = rewards_arr[t] + discount * future
+                    future_vals.append(future)
+                target_seq = torch.tensor(future_vals, dtype=torch.float32).view(1, T)
+
+        preds.extend(pred.reshape(-1).cpu().tolist())
+        targets.extend(target_seq.reshape(-1).cpu().tolist())
 
     return np.array(preds), np.array(targets)
 
@@ -220,6 +269,10 @@ def main():
 
     cfg = safe_load(Path(args.fname).read_text())
     action_embed_dim = cfg["model"].get("action_embed_dim")
+    model_requires_latents = cfg["model"].get("use_external_action_tokens", False)
+    use_action_latents = args.use_action_latents or model_requires_latents
+    if model_requires_latents and not use_action_latents:
+        raise ValueError("Model expects external action tokens; enable --use-action-latents.")
 
     mapper = load_action_mapper(Path(args.action_mapping) if args.action_mapping else None, action_embed_dim)
     if mapper is not None:
@@ -248,7 +301,9 @@ def main():
         raise IndexError(f"Episode index {args.episode_index} out of range (found {len(real_eps)} episodes).")
 
     episode_entries = real_eps[args.episode_index]
-    frames, actions, rewards, returns = prepare_episode(episode_entries, mapper, action_dim)
+    frames, actions, rewards, returns, latents = prepare_episode(
+        episode_entries, mapper, action_dim, use_action_latents, args.action_latent_suffix
+    )
 
     tokens_per_frame = int((crop_size // patch_size) ** 2)
     normalize_reps = cfg["loss"].get("normalize_reps", False)
@@ -258,6 +313,7 @@ def main():
         actions,
         rewards,
         returns,
+        latents,
         encoder,
         predictor,
         head,
@@ -268,6 +324,7 @@ def main():
         tokens_per_frame,
         normalize_reps,
         use_target,
+        use_action_latents,
         mode,
         discount,
         args.frames_per_clip,
