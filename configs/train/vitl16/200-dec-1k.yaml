@@ -1,0 +1,70 @@
+app: frame_decoder
+nodes: 8
+tasks_per_node: 8
+cpus_per_task: 12
+mem_per_gpu: 120G
+
+# Decoder checkpoints/logs will be written here.
+folder: output/pre_ipr_era/DEC/200-games/11130251-finegrained
+
+# Reuse the encoder training config for model/data defaults (dataset list, crop/patch/tubelet sizes, etc.)
+encoder:
+  config: configs/train/vitl16/200-enc-1k.yaml
+  checkpoint: output/pre_ipr_era/ENC/200-games/11130251-finegrained/e4.pt
+
+meta:
+  dtype: bfloat16
+  seed: 239
+  use_grad_scaler: true
+  log_freq: 20
+  save_freq: 1000
+  load_checkpoint: false
+  read_checkpoint: null
+  load_optimizer: true
+
+# Only specify overrides here; anything not set falls back to the encoder config.
+data:
+  # Appendix B.3: use short clips (paper uses 4-frame clips).
+  frames_per_clip: 4
+  frame_stride: 1
+  # Per-process clip batch size. Effective "frame" batch is batch_size*(frames_per_clip/tubelet_size)*world_size.
+  batch_size: 32
+  num_workers: 8
+  pin_mem: true
+  persistent_workers: true
+
+data_aug:
+  # Defaults are taken from the encoder config; keep explicit here to avoid surprises.
+  auto_augment: false
+  horizontal_flip: false
+  motion_shift: false
+  random_resize_aspect_ratio:
+    - 0.75
+    - 1.35
+  random_resize_scale:
+    - 0.3
+    - 1.0
+  reprob: 0.0
+
+decoder:
+  # Deterministic ViT-style frame decoder (Appendix B.3).
+  depth: 24
+  num_heads: 16
+  mlp_ratio: 4.0
+  out_act: none
+  feature_layer_norm: true
+
+optimization:
+  total_steps: 150000
+  warmup_steps: 2000
+  lr: 5.0e-4
+  start_lr: 0.0
+  final_lr: 0.0
+  weight_decay: 0.1
+  final_weight_decay: 0.1
+  grad_clip_norm: 1.0
+  betas:
+    - 0.9
+    - 0.999
+  eps: 1.0e-8
+
