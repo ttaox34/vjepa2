@@ -210,6 +210,13 @@ def main(args, resume_preempt: bool = False):
     action_mappings = cfg_data.get("action_mappings")
     state_keys = cfg_data.get("state_keys")
     action_dim = cfg_data.get("action_dim", None)
+    # RetroGameDataset requires a global action dim when action_mappings are provided.
+    # Encoder configs commonly store this under model.action_embed_dim.
+    if action_dim is None:
+        action_dim = (enc_train_cfg.get("model", {}) or {}).get("action_embed_dim", None)
+    if action_dim is None and action_mappings:
+        logger.warning("action_mappings provided but action_dim is None; disabling action_mappings for decoder training.")
+        action_mappings = None
     frame_stride = int(cfg_data.get("frame_stride", 1) or 1)
     frames_per_clip = int(cfg_data.get("frames_per_clip", 4))
     batch_size = int(cfg_data.get("batch_size", 32))
@@ -445,4 +452,3 @@ def main(args, resume_preempt: bool = False):
 
         if (step + 1) % save_freq == 0 or (step == total_steps - 1):
             save_checkpoint(step + 1, latest_path)
-

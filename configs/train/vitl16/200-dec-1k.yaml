@@ -5,7 +5,7 @@ cpus_per_task: 12
 mem_per_gpu: 120G
 
 # Decoder checkpoints/logs will be written here.
-folder: output/pre_ipr_era/DEC/200-games/11130251-finegrained
+folder: output/post_ipr_era/DEC/200-games/01192347
 
 # Reuse the encoder training config for model/data defaults (dataset list, crop/patch/tubelet sizes, etc.)
 encoder:
@@ -29,6 +29,8 @@ data:
   frame_stride: 1
   # Per-process clip batch size. Effective "frame" batch is batch_size*(frames_per_clip/tubelet_size)*world_size.
   batch_size: 32
+  # Needed when reusing encoder's per-game action_mappings; matches model.action_embed_dim from encoder config.
+  action_dim: 134
   num_workers: 8
   pin_mem: true
   persistent_workers: true
@@ -67,4 +69,3 @@ optimization:
     - 0.9
     - 0.999
   eps: 1.0e-8
-
