@@ -141,6 +141,11 @@ def main(args, resume_preempt: bool = False):
         raise ValueError("Missing required config key: folder")
 
     cfg_meta = args.get("meta", {}) or {}
+    use_tensorboard = bool(cfg_meta.get("use_tensorboard", False))
+    tensorboard_logdir = cfg_meta.get("tensorboard_logdir")
+    tb_image_freq = int(cfg_meta.get("tensorboard_image_freq", 0) or 0)
+    tb_num_images = int(cfg_meta.get("tensorboard_num_images", 4) or 4)
+
     dtype_name = str(cfg_meta.get("dtype", "bfloat16")).lower()
     if dtype_name == "bfloat16":
         dtype = torch.bfloat16
@@ -166,6 +171,18 @@ def main(args, resume_preempt: bool = False):
         local_rank = int(os.environ.get("LOCAL_RANK", 0))
         device = torch.device(f"cuda:{local_rank}")
         torch.cuda.set_device(device)
+
+    writer = None
+    if use_tensorboard and rank == 0:
+        tb_dir = tensorboard_logdir or os.path.join(folder, "tensorboard")
+        try:
+            from torch.utils.tensorboard import SummaryWriter
+
+            writer = SummaryWriter(log_dir=tb_dir)
+            logger.info(f"TensorBoard enabled: writing logs to {tb_dir}")
+        except Exception as e:
+            logger.warning(f"Failed to initialize TensorBoard SummaryWriter at {tb_dir}: {e}")
+            writer = None
 
     # --------------------------------------------------------------------- #
     # Encoder config / checkpoint (re-using the encoder training config avoids
@@ -381,6 +398,11 @@ def main(args, resume_preempt: bool = False):
         clip = clip.to(device, non_blocking=True)
         data_elapsed_ms = (time.time() - t0) * 1000.0
 
+        global_step = step + 1
+        should_log_images = (
+            writer is not None and tb_image_freq > 0 and (global_step % tb_image_freq == 0) and tb_num_images > 0
+        )
+
         def train_step():
             optimizer.zero_grad(set_to_none=True)
             new_lr = lr_sched.step()
@@ -425,13 +447,29 @@ def main(args, resume_preempt: bool = False):
                     torch.nn.utils.clip_grad_norm_(decoder.parameters(), max_norm=grad_clip_norm)
                 optimizer.step()
 
-            return float(loss.item()), float(new_lr), float(new_wd)
+            vis = None
+            if should_log_images:
+                n = min(int(tb_num_images), int(pred.shape[0]))
+                # Concatenate target and prediction for easier qualitative inspection.
+                vis = torch.cat([target[:n], pred[:n]], dim=3).detach().float().cpu().clamp(0.0, 1.0)
+            return float(loss.item()), float(new_lr), float(new_wd), vis
 
-        (loss, new_lr, new_wd), gpu_ms = gpu_timer(train_step)
+        (loss, new_lr, new_wd, vis), gpu_ms = gpu_timer(train_step)
         iter_ms = (time.time() - t0) * 1000.0
 
         loss_meter.update(loss)
         csv_logger.log(step + 1, loss, new_lr, new_wd, iter_ms, gpu_ms, data_elapsed_ms)
+
+        if writer is not None:
+            writer.add_scalar("train/loss", loss, global_step)
+            writer.add_scalar("train/loss_avg", loss_meter.avg, global_step)
+            writer.add_scalar("train/lr", new_lr, global_step)
+            writer.add_scalar("train/wd", new_wd, global_step)
+            writer.add_scalar("time/iter_ms", iter_ms, global_step)
+            writer.add_scalar("time/gpu_ms", gpu_ms, global_step)
+            writer.add_scalar("time/data_ms", data_elapsed_ms, global_step)
+            if vis is not None:
+                writer.add_images("recon/target_pred", vis, global_step, dataformats="NCHW")
 
         if (step % log_freq == 0) or (step == total_steps - 1) or math.isnan(loss) or math.isinf(loss):
             logger.info(
@@ -452,3 +490,6 @@ def main(args, resume_preempt: bool = False):
 
         if (step + 1) % save_freq == 0 or (step == total_steps - 1):
             save_checkpoint(step + 1, latest_path)
+
+    if writer is not None:
+        writer.close()
